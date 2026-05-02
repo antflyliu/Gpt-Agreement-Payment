@@ -1,0 +1,73 @@
+{
+  "app": {
+    "title": "GPT-AGREEMENT-PAYMENT"
+  },
+  "auth": {
+    "banner": "GPT-AGREEMENT-PAYMENT // Authentication",
+    "subtitle": "Enter credentials to access the setup wizard",
+    "login": "Login",
+    "logging_in": "Logging in…",
+    "username": "User",
+    "password": "Password",
+    "login_failed": "Login failed"
+  },
+  "setup": {
+    "title": "Initial Setup",
+    "create_admin": "Create Admin Account",
+    "confirm_password": "Confirm Password"
+  },
+  "wizard": {
+    "phase": "Phase",
+    "step": "Step",
+    "steps": {
+      "mode": "MODE",
+      "system": "SYSTEM",
+      "cf": "CF",
+      "imap": "IMAP",
+      "proxy": "PROXY",
+      "paypal": "PAYPAL",
+      "gopay": "GOPAY",
+      "card": "CARD",
+      "captcha": "CAPTCHA",
+      "vlm": "VLM",
+      "team": "TEAM",
+      "downstream": "EXPORT",
+      "daemon": "DAEMON",
+      "stripe": "STRIPE",
+      "finish": "DONE"
+    },
+    "phases": {
+      "basic": "Basic",
+      "payment": "Payment",
+      "optional": "Optional",
+      "downstream": "Downstream",
+      "exit": "Exit"
+    }
+  },
+  "run": {
+    "title": "Run Console",
+    "start": "Start",
+    "stop": "Stop",
+    "status": "Status",
+    "running": "Running",
+    "stopped": "Stopped",
+    "otp_prompt": "Enter OTP code",
+    "submit_otp": "Submit OTP"
+  },
+  "preflight": {
+    "running": "Checking…",
+    "pass": "Pass",
+    "fail": "Fail",
+    "warn": "Warning"
+  },
+  "common": {
+    "save": "Save",
+    "cancel": "Cancel",
+    "next": "Next",
+    "prev": "Previous",
+    "loading": "Loading…",
+    "error": "Error",
+    "success": "Success",
+    "confirm": "Confirm"
+  }
+}

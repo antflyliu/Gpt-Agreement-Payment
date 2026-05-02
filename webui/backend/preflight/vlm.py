@@ -1,6 +1,11 @@
+import logging
+
 import httpx
 from pydantic import BaseModel
+
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.vlm")
 
 
 class VLMInput(BaseModel):
@@ -22,11 +27,13 @@ def check(body: dict) -> PreflightResult:
             r = c.post(cfg.base_url.rstrip("/") + "/chat/completions",
                        headers=headers, json=payload)
     except httpx.HTTPError as e:
+        log.error("vlm.connect_error: %s", e)
         return aggregate([CheckResult(name="api", status="fail",
                                       message=str(e))])
     if r.status_code == 200:
         return aggregate([CheckResult(name="api", status="ok",
                                       message=f"{cfg.model} responded")])
+    log.warning("vlm.api_error: HTTP %d", r.status_code)
     return aggregate([CheckResult(name="api", status="fail",
                                   message=f"HTTP {r.status_code}",
                                   details=r.text[:1000])])

@@ -1,6 +1,11 @@
+import logging
 import shutil
 import sys
+
+from ..errors import PreflightError
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.system")
 
 
 def check() -> PreflightResult:
@@ -11,8 +16,12 @@ def check() -> PreflightResult:
         checks.append(CheckResult(name="python", status="ok",
                                   message=f"Python {sys.version.split()[0]}"))
     else:
-        checks.append(CheckResult(name="python", status="fail",
-                                  message=f"Python {sys.version.split()[0]} < 3.10"))
+        log.error("system.python_too_old: %s", sys.version.split()[0])
+        raise PreflightError(
+            code="system.python_too_old",
+            msg=f"Python {sys.version.split()[0]} < 3.10",
+            hint="Upgrade to Python 3.10+.",
+        )
 
     # Binaries
     for binary in ("camoufox", "xvfb-run"):

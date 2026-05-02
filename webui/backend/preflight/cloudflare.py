@@ -1,6 +1,11 @@
+import logging
+
 import httpx
 from pydantic import BaseModel
+
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.cloudflare")
 
 CF = "https://api.cloudflare.com/client/v4"
 
@@ -24,10 +29,12 @@ def check(body: dict) -> PreflightResult:
                                           message="token active"))
             else:
                 msg = "; ".join(e.get("message", "") for e in data.get("errors", [])) or f"HTTP {r.status_code}"
+                log.warning("cloudflare.token_invalid: %s", msg)
                 checks.append(CheckResult(name="token", status="fail",
                                           message=msg, details=r.text[:1000]))
                 return aggregate(checks)
         except httpx.HTTPError as e:
+            log.error("cloudflare.connect_error: %s", e)
             checks.append(CheckResult(name="token", status="fail",
                                       message=str(e)))
             return aggregate(checks)
@@ -40,10 +47,12 @@ def check(body: dict) -> PreflightResult:
                     checks.append(CheckResult(name=f"zone:{zone}", status="ok",
                                               message=f"zone id {data['result'][0]['id']}"))
                 else:
+                    log.warning("cloudflare.zone_not_found: %s", zone)
                     checks.append(CheckResult(name=f"zone:{zone}", status="fail",
                                               message="zone not found / no access",
                                               details=r.text[:1000]))
             except httpx.HTTPError as e:
+                log.error("cloudflare.zone_check_error: zone=%s err=%s", zone, e)
                 checks.append(CheckResult(name=f"zone:{zone}", status="fail",
                                           message=str(e)))
     return aggregate(checks)

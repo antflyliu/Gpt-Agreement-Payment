@@ -1,0 +1,73 @@
+{
+  "app": {
+    "title": "GPT-AGREEMENT-PAYMENT"
+  },
+  "auth": {
+    "banner": "GPT-AGREEMENT-PAYMENT // 身份认证",
+    "subtitle": "输入凭据访问配置向导",
+    "login": "登录",
+    "logging_in": "登录中…",
+    "username": "用户",
+    "password": "密码",
+    "login_failed": "登录失败"
+  },
+  "setup": {
+    "title": "初始设置",
+    "create_admin": "创建管理员账号",
+    "confirm_password": "确认密码"
+  },
+  "wizard": {
+    "phase": "阶段",
+    "step": "步",
+    "steps": {
+      "mode": "模式",
+      "system": "系统",
+      "cf": "CF",
+      "imap": "IMAP",
+      "proxy": "代理",
+      "paypal": "PAYPAL",
+      "gopay": "GOPAY",
+      "card": "卡片",
+      "captcha": "打码",
+      "vlm": "VLM",
+      "team": "TEAM",
+      "downstream": "推送",
+      "daemon": "DAEMON",
+      "stripe": "STRIPE",
+      "finish": "完成"
+    },
+    "phases": {
+      "basic": "基础",
+      "payment": "支付",
+      "optional": "可选",
+      "downstream": "下游",
+      "exit": "出口"
+    }
+  },
+  "run": {
+    "title": "运行控制台",
+    "start": "启动",
+    "stop": "停止",
+    "status": "状态",
+    "running": "运行中",
+    "stopped": "已停止",
+    "otp_prompt": "请输入 OTP 验证码",
+    "submit_otp": "提交 OTP"
+  },
+  "preflight": {
+    "running": "检测中…",
+    "pass": "通过",
+    "fail": "失败",
+    "warn": "警告"
+  },
+  "common": {
+    "save": "保存",
+    "cancel": "取消",
+    "next": "下一步",
+    "prev": "上一步",
+    "loading": "加载中…",
+    "error": "错误",
+    "success": "成功",
+    "confirm": "确认"
+  }
+}

@@ -1,12 +1,19 @@
+import logging
 import os
+import shutil
 import subprocess
 import socket as _sock
+import tempfile
 import time
 from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel
+
+from ..errors import PreflightError
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.proxy")
 
 
 # Camoufox 不支持 socks5+auth；CTF-reg/browser_register.py 期望本地
@@ -35,9 +42,9 @@ def _port_listening(port: int) -> bool:
 
 def _spawn_gost_relay(upstream_url: str, listen_port: int) -> tuple[bool, str]:
     """Spawn `gost -L=socks5://:N -F=<upstream>` as a daemon. Returns (ok, msg)."""
-    if not subprocess.run(["which", "gost"], capture_output=True).stdout.strip():
+    if not shutil.which("gost"):
         return False, "gost 未安装：apt 不带，到 https://github.com/go-gost/gost/releases 下二进制扔到 /usr/local/bin/"
-    log_path = f"/tmp/gost-{listen_port}.log"
+    log_path = os.path.join(tempfile.gettempdir(), f"gost-{listen_port}.log")
     cmd = ["gost", f"-L=socks5://:{listen_port}", f"-F={upstream_url}"]
     try:
         fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -69,8 +76,11 @@ def check(body: dict) -> PreflightResult:
 
     proxy_url = cfg.url
     if not proxy_url:
-        return aggregate([CheckResult(name="proxy", status="fail",
-                                      message="proxy url required for mode=" + cfg.mode)])
+        raise PreflightError(
+            code="proxy.url_missing",
+            msg=f"proxy url required for mode={cfg.mode}",
+            hint="Set a valid proxy URL in the wizard.",
+        )
 
     checks: list[CheckResult] = []
 
@@ -79,6 +89,7 @@ def check(body: dict) -> PreflightResult:
         with httpx.Client(proxy=proxy_url, timeout=15.0) as c:
             ip = c.get("https://api.ipify.org").text.strip()
     except Exception as e:
+        log.error("proxy.connect_error: %s", e)
         return aggregate([CheckResult(name="connect", status="fail",
                                       message=f"proxy connect failed: {e}")])
     checks.append(CheckResult(name="exit_ip", status="ok", message=ip))
@@ -96,6 +107,7 @@ def check(body: dict) -> PreflightResult:
         else:
             checks.append(CheckResult(name="country", status="ok", message=msg))
     except Exception as e:
+        log.warning("proxy.geo_lookup_failed: %s", e)
         checks.append(CheckResult(name="country", status="warn",
                                   message=f"geo lookup failed: {e}"))
 

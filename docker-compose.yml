@@ -1,0 +1,24 @@
+services:
+  webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: webui
+    ports:
+      - "8765:8765"
+    volumes:
+      - ./output:/app/output
+      - ./CTF-pay/config.paypal.json:/app/CTF-pay/config.paypal.json:ro
+      - ./CTF-reg/config.paypal-proxy.json:/app/CTF-reg/config.paypal-proxy.json:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  ml-solver:
+    profiles: ["with-ml"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: ml
+    volumes:
+      - ./output:/app/output
