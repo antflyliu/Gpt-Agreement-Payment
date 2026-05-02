@@ -33,6 +33,7 @@ def _setup_logging() -> None:
     if not root.handlers:
         root.addHandler(handler)
         root.setLevel(logging.INFO)
+        root.propagate = False
 
 
 def create_app() -> FastAPI:
@@ -55,8 +56,9 @@ def create_app() -> FastAPI:
     @app.exception_handler(ValidationError)
     async def _validation_error_handler(request, exc: ValidationError):
         logger.warning("ValidationError: %s", exc)
-        first = exc.errors()[0] if exc.errors() else {}
-        field = ".".join(str(l) for l in first.get("loc", []))
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        field = ".".join(str(loc) for loc in first.get("loc", []))
         return JSONResponse(
             status_code=422,
             content={
@@ -64,6 +66,7 @@ def create_app() -> FastAPI:
                 "code": "validation_error",
                 "message": f"{field}: {first.get('msg', str(exc))}",
                 "hint": "Check the input fields and try again.",
+                "checks": [],
             },
         )
 
@@ -105,4 +108,4 @@ def create_app() -> FastAPI:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
+    uvicorn.run(create_app(), host="0.0.0.0", port=8765)

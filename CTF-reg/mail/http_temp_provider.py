@@ -10,6 +10,7 @@ import random
 import re
 import string
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -77,6 +78,17 @@ class HTTPTempMailProvider:
                 msg_id = msg.get("id")
                 if not msg_id:
                     continue
+                if issued_after is not None:
+                    msg_date_str = msg.get("date", "")
+                    if msg_date_str:
+                        try:
+                            msg_ts = datetime.strptime(
+                                msg_date_str, "%Y-%m-%d %H:%M:%S"
+                            ).replace(tzinfo=timezone.utc).timestamp()
+                            if msg_ts < issued_after:
+                                continue
+                        except ValueError:
+                            pass
                 try:
                     detail = requests.get(
                         _API,

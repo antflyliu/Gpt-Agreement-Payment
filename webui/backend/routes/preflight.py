@@ -42,13 +42,11 @@ def run_check(name: str, body: dict, user: str = CurrentUser):
         raise HTTPException(status_code=404, detail=f"unknown check: {name}")
     try:
         return fn(body)
-    except PreflightError:
-        raise
-    except ValidationError:
+    except (PreflightError, ValidationError):
         raise
     except Exception as e:
         log.exception("Unhandled error in preflight check '%s'", name)
         return aggregate([CheckResult(
             name=name, status="fail",
-            message=f"{name}.internal_error: {type(e).__name__}: {e}",
+            message=f"{name}.internal_error",
         )])

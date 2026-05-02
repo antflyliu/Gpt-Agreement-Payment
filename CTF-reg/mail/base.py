@@ -5,8 +5,6 @@ can swap IMAP / HTTP temp mail / Webhook / Gmail transparently.
 """
 from __future__ import annotations
 
-import re
-from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 

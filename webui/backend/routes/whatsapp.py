@@ -12,6 +12,7 @@ import secrets
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
+from ..auth import CurrentUser
 from .. import runner
 
 log = logging.getLogger("webui.whatsapp")
@@ -28,6 +29,11 @@ def get_or_create_token() -> str:
         _OTP_TOKEN = secrets.token_urlsafe(32)
         log.info("Generated new OTP token (store it in your forwarder app)")
     return _OTP_TOKEN
+
+
+import re
+
+_OTP_PATTERN = re.compile(r"^\d{4,8}$")
 
 
 class ExternalOTPRequest(BaseModel):
@@ -54,6 +60,8 @@ def receive_external_otp(
     otp_value = body.otp.strip()
     if not otp_value:
         raise HTTPException(status_code=422, detail="otp field is empty")
+    if not _OTP_PATTERN.match(otp_value):
+        raise HTTPException(status_code=422, detail="otp must be 4-8 digits")
 
     try:
         runner.submit_otp(otp_value)
@@ -65,6 +73,6 @@ def receive_external_otp(
 
 
 @router.get("/token")
-def show_token():
+def show_token(user: str = CurrentUser):
     """Return the current OTP token (webui settings page uses this)."""
     return {"token": get_or_create_token()}

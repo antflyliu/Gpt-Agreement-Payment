@@ -10,26 +10,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY CTF-pay/requirements*.txt CTF-pay/
-COPY CTF-reg/requirements*.txt CTF-reg/
 COPY webui/requirements.txt webui/
 
 RUN pip install --no-cache-dir \
         requests curl_cffi playwright camoufox browserforge mitmproxy pybase64 \
     && pip install --no-cache-dir -r webui/requirements.txt \
-    && playwright install firefox \
+    && playwright install firefox chromium \
     && camoufox fetch
 
 # ── Stage 2: webui (frontend build + runtime) ─────────────────
 FROM base AS webui
 
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource.sh \
+    && bash /tmp/nodesource.sh \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g pnpm \
+    && rm -f /tmp/nodesource.sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY webui/frontend/package.json webui/frontend/pnpm-lock.yaml* webui/frontend/
-RUN cd webui/frontend && pnpm install --frozen-lockfile 2>/dev/null || pnpm install
+RUN cd webui/frontend && pnpm install --frozen-lockfile || pnpm install
 
 COPY webui/frontend/ webui/frontend/
 RUN cd webui/frontend && pnpm build

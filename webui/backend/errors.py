@@ -1,9 +1,13 @@
 """Unified error types for the webui backend.
 
-Every preflight module should raise ``PreflightError`` instead of bare
-``RuntimeError`` / returning ad-hoc dicts.  The FastAPI global handler
-converts it to a structured JSON response with *code*, *message*, and
-an actionable *hint* for the end-user.
+Preflight modules should raise ``PreflightError`` for **fatal configuration
+issues** (missing required fields, incompatible environment) where continuing
+the check makes no sense.  Routine check failures (API returned 4xx, Luhn
+mismatch, etc.) should still use ``aggregate([CheckResult(status='fail')])``
+so the UI can display a partial result grid.
+
+The FastAPI global handler converts ``PreflightError`` to a structured JSON
+response with *code*, *message*, and an actionable *hint* for the end-user.
 """
 
 

@@ -20,11 +20,13 @@ def check(body: dict) -> PreflightResult:
             r = c.get(cfg.base_url.rstrip("/") + "/v0/health",
                       headers={"X-Admin-Key": cfg.admin_key})
     except httpx.HTTPError as e:
+        log.error("cpa.connect_error: %s", e)
         return aggregate([CheckResult(name="health", status="fail",
                                       message=str(e))])
     if r.status_code == 200:
         return aggregate([CheckResult(name="health", status="ok",
                                       message="health ok")])
+    log.warning("cpa.health_error: HTTP %d", r.status_code)
     return aggregate([CheckResult(name="health", status="fail",
                                   message=f"HTTP {r.status_code}",
                                   details=r.text[:1000])])

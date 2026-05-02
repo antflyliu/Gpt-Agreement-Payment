@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel
 
+from ..errors import PreflightError
 from ._common import CheckResult, PreflightResult, aggregate
 
 log = logging.getLogger("webui.preflight.proxy")
@@ -75,8 +76,11 @@ def check(body: dict) -> PreflightResult:
 
     proxy_url = cfg.url
     if not proxy_url:
-        return aggregate([CheckResult(name="proxy", status="fail",
-                                      message="proxy url required for mode=" + cfg.mode)])
+        raise PreflightError(
+            code="proxy.url_missing",
+            msg=f"proxy url required for mode={cfg.mode}",
+            hint="Set a valid proxy URL in the wizard.",
+        )
 
     checks: list[CheckResult] = []
 
@@ -85,6 +89,7 @@ def check(body: dict) -> PreflightResult:
         with httpx.Client(proxy=proxy_url, timeout=15.0) as c:
             ip = c.get("https://api.ipify.org").text.strip()
     except Exception as e:
+        log.error("proxy.connect_error: %s", e)
         return aggregate([CheckResult(name="connect", status="fail",
                                       message=f"proxy connect failed: {e}")])
     checks.append(CheckResult(name="exit_ip", status="ok", message=ip))
@@ -102,6 +107,7 @@ def check(body: dict) -> PreflightResult:
         else:
             checks.append(CheckResult(name="country", status="ok", message=msg))
     except Exception as e:
+        log.warning("proxy.geo_lookup_failed: %s", e)
         checks.append(CheckResult(name="country", status="warn",
                                   message=f"geo lookup failed: {e}"))
 

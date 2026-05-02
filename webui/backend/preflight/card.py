@@ -46,6 +46,7 @@ def check(body: dict) -> PreflightResult:
         checks.append(CheckResult(name="luhn", status="ok",
                                   message=f"valid (last4 {cfg.number[-4:]})"))
     else:
+        log.warning("card.luhn_fail: last4=%s", cfg.number[-4:])
         checks.append(CheckResult(name="luhn", status="fail",
                                   message="card number fails Luhn"))
 
@@ -64,6 +65,7 @@ def check(body: dict) -> PreflightResult:
             last_day = (datetime.date(exp_year + (m == 12), (m % 12) + 1, 1)
                         - datetime.timedelta(days=1))
             if last_day < now:
+                log.warning("card.expired: %02d/%d", m, exp_year)
                 checks.append(CheckResult(name="exp", status="fail",
                                           message=f"expired {m:02d}/{exp_year}"))
             else:

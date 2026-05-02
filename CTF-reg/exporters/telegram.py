@@ -19,16 +19,21 @@ class TelegramExporter:
         self._token = bot_token
         self._chat_id = str(chat_id)
 
+    @staticmethod
+    def _esc(text: str) -> str:
+        """Escape special chars for Telegram HTML parse_mode."""
+        return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     def export(self, account: AccountResult) -> ExportResult:
         lines = [
-            f"*New Account*",
-            f"Email: `{account.email}`",
-            f"Status: {account.subscription_status}",
+            "<b>New Account</b>",
+            f"Email: <code>{self._esc(account.email)}</code>",
+            f"Status: {self._esc(account.subscription_status)}",
         ]
         if account.team_account_id:
-            lines.append(f"Team: `{account.team_account_id}`")
+            lines.append(f"Team: <code>{self._esc(account.team_account_id)}</code>")
         if account.refresh_token:
-            lines.append(f"RT: `{account.refresh_token[:20]}...`")
+            lines.append(f"RT: <code>{self._esc(account.refresh_token[:20])}...</code>")
         text = "\n".join(lines)
 
         url = f"{_TG_API}/bot{self._token}/sendMessage"
@@ -38,7 +43,7 @@ class TelegramExporter:
                 json={
                     "chat_id": self._chat_id,
                     "text": text,
-                    "parse_mode": "Markdown",
+                    "parse_mode": "HTML",
                 },
                 timeout=15,
             )
