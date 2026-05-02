@@ -1,6 +1,7 @@
 .git
 .github
 .omc
+.specstory
 __pycache__
 *.pyc
 *.pyo

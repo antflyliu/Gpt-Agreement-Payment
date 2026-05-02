@@ -50,6 +50,7 @@ def create_app() -> FastAPI:
                 "code": exc.code,
                 "message": exc.msg,
                 "hint": exc.hint,
+                "checks": [],
             },
         )
 

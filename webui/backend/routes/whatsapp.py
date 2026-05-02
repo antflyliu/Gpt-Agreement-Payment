@@ -7,6 +7,7 @@ legacy wa_relay / gopay modal used.
 """
 import logging
 import os
+import re
 import secrets
 
 from fastapi import APIRouter, Header, HTTPException
@@ -30,8 +31,6 @@ def get_or_create_token() -> str:
         log.info("Generated new OTP token (store it in your forwarder app)")
     return _OTP_TOKEN
 
-
-import re
 
 _OTP_PATTERN = re.compile(r"^\d{4,8}$")
 
@@ -73,6 +72,6 @@ def receive_external_otp(
 
 
 @router.get("/token")
-def show_token(user: str = CurrentUser):
+def show_token(_: str = CurrentUser):
     """Return the current OTP token (webui settings page uses this)."""
     return {"token": get_or_create_token()}

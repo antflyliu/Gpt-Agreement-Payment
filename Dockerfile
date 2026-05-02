@@ -29,7 +29,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource.sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY webui/frontend/package.json webui/frontend/pnpm-lock.yaml* webui/frontend/
-RUN cd webui/frontend && pnpm install --frozen-lockfile || pnpm install
+RUN cd webui/frontend && pnpm install --frozen-lockfile
 
 COPY webui/frontend/ webui/frontend/
 RUN cd webui/frontend && pnpm build

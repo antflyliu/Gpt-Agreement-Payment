@@ -16,6 +16,7 @@ def check() -> PreflightResult:
         checks.append(CheckResult(name="python", status="ok",
                                   message=f"Python {sys.version.split()[0]}"))
     else:
+        log.error("system.python_too_old: %s", sys.version.split()[0])
         raise PreflightError(
             code="system.python_too_old",
             msg=f"Python {sys.version.split()[0]} < 3.10",
