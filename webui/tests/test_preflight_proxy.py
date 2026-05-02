@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import respx
 from httpx import Response
 
@@ -8,7 +10,8 @@ def _login(client):
 
 
 @respx.mock
-def test_proxy_ok_country_match(client):
+@patch("webui.backend.preflight.proxy._port_listening", return_value=True)
+def test_proxy_ok_country_match(_mock_port, client):
     _login(client)
     respx.get("https://api.ipify.org").mock(return_value=Response(200, text="1.2.3.4"))
     respx.get("http://ip-api.com/json/1.2.3.4").mock(
@@ -23,7 +26,8 @@ def test_proxy_ok_country_match(client):
 
 
 @respx.mock
-def test_proxy_country_mismatch(client):
+@patch("webui.backend.preflight.proxy._port_listening", return_value=True)
+def test_proxy_country_mismatch(_mock_port, client):
     _login(client)
     respx.get("https://api.ipify.org").mock(return_value=Response(200, text="1.2.3.4"))
     respx.get("http://ip-api.com/json/1.2.3.4").mock(

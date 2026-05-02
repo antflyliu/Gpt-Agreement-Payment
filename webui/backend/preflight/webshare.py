@@ -1,6 +1,11 @@
+import logging
+
 import httpx
 from pydantic import BaseModel
+
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.webshare")
 
 WS_API = "https://proxy.webshare.io/api/v2"
 

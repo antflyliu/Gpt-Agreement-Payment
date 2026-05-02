@@ -1,6 +1,11 @@
 import datetime
+import logging
+
 from pydantic import BaseModel
+
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.card")
 
 # Heuristic country↔currency map; warn-only on mismatch
 COUNTRY_CURRENCY = {

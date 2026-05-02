@@ -1,6 +1,10 @@
+import logging
 import shutil
 import sys
+
 from ._common import CheckResult, PreflightResult, aggregate
+
+log = logging.getLogger("webui.preflight.system")
 
 
 def check() -> PreflightResult:

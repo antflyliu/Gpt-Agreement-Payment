@@ -85,7 +85,20 @@ python -m webui.server
 
 支持 Plus 和 Team 双订阅路径，公网访问通过 nginx 反代见 [`webui/README.md`](webui/README.md)。
 
-### 装
+### Docker（推荐新手）
+
+```bash
+git clone https://github.com/DanOps-1/Gpt-Agreement-Payment
+cd Gpt-Agreement-Payment
+cp CTF-pay/config.paypal.example.json CTF-pay/config.paypal.json
+# 编辑配置文件填入真实值 …
+docker compose up
+# 浏览器打开 http://localhost:8765
+```
+
+需要 ML solver 时：`docker compose --profile with-ml up`。
+
+### 手动装
 
 ```bash
 git clone https://github.com/DanOps-1/Gpt-Agreement-Payment

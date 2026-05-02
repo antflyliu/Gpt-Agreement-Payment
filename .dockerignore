@@ -1,0 +1,17 @@
+.git
+.github
+.omc
+__pycache__
+*.pyc
+*.pyo
+output/
+CTF-pay/test_runs/
+CTF-pay/log.txt
+flows*
+node_modules/
+webui/frontend/node_modules/
+webui/frontend/.vite/
+*.egg-info/
+.env
+*.log
+.DS_Store
