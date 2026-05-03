@@ -10,7 +10,7 @@ router = APIRouter(prefix="/api/run", tags=["run"])
 
 
 class StartRequest(BaseModel):
-    mode: str = Field(pattern="^(single|batch|self_dealer|daemon)$")
+    mode: str = Field(pattern="^(single|batch|self_dealer|daemon|free_register|free_backfill_rt)$")
     paypal: bool = True
     batch: int = 0
     workers: int = 3
@@ -18,6 +18,7 @@ class StartRequest(BaseModel):
     register_only: bool = False
     pay_only: bool = False
     gopay: bool = False
+    count: int = 0  # free_register 模式下注册次数（0 = 无限）
 
 
 class OTPRequest(BaseModel):
@@ -94,6 +95,6 @@ def preview(req: StartRequest, user: str = CurrentUser):
     """干跑：只返命令行不实际启动。"""
     cmd = runner.build_cmd(
         req.mode, req.paypal, req.batch, req.workers, req.self_dealer,
-        req.register_only, req.pay_only, gopay=req.gopay,
+        req.register_only, req.pay_only, gopay=req.gopay, count=req.count,
     )
     return {"cmd": cmd, "cmd_str": " ".join(cmd)}

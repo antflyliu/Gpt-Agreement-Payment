@@ -33,10 +33,19 @@ _otp_pending: bool = False             # set when gopay.py emits OTP_REQUEST
 
 def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: int,
               register_only: bool, pay_only: bool, gopay: bool = False,
-              gopay_otp_file: str = "") -> list[str]:
+              gopay_otp_file: str = "", count: int = 0) -> list[str]:
     """根据参数拼出最终命令行。"""
     cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
            "--config", str(s.PAY_CONFIG_PATH)]
+    # free_only 两个子模式不需要 paypal / gopay 支付段
+    if mode in ("free_register", "free_backfill_rt"):
+        if mode == "free_register":
+            cmd.append("--free-register")
+            if count > 0:
+                cmd.extend(["--count", str(count)])
+        else:
+            cmd.append("--free-backfill-rt")
+        return cmd
     if gopay:
         cmd.append("--gopay")
         if gopay_otp_file:
@@ -75,7 +84,7 @@ def status() -> dict:
 
 def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
           self_dealer: int = 0, register_only: bool = False, pay_only: bool = False,
-          gopay: bool = False) -> dict:
+          gopay: bool = False, count: int = 0) -> dict:
     global _proc, _started_at, _ended_at, _exit_code, _cmd, _mode
     global _log_lines, _seq_counter, _otp_file, _otp_pending
     with _lock:
@@ -96,7 +105,7 @@ def start(*, mode: str, paypal: bool = True, batch: int = 0, workers: int = 3,
 
         cmd = build_cmd(mode, paypal, batch, workers, self_dealer,
                         register_only, pay_only, gopay=gopay,
-                        gopay_otp_file=otp_path)
+                        gopay_otp_file=otp_path, count=count)
 
         # Reset
         _log_lines = []

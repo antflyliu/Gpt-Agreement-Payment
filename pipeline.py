@@ -585,7 +585,7 @@ from mail_provider import MailProvider
 from browser_register import browser_register
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.imap_server, cfg.mail.imap_port, cfg.mail.email, cfg.mail.auth_code, cfg.mail.catch_all_domain)
+mail = MailProvider(cfg.mail.catch_all_domain)
 result = browser_register(cfg, mail)
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result, ensure_ascii=False), flush=True)
 """
@@ -600,7 +600,7 @@ from auth_flow import AuthFlow
 from mail_provider import MailProvider
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 cfg = Config.from_file(config_path)
-mail = MailProvider(cfg.mail.imap_server, cfg.mail.imap_port, cfg.mail.email, cfg.mail.auth_code, cfg.mail.catch_all_domain)
+mail = MailProvider(cfg.mail.catch_all_domain)
 flow = AuthFlow(cfg)
 result = flow.run_register(mail)
 print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False), flush=True)
@@ -1106,6 +1106,187 @@ def _append_result(record):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         pass
+
+
+# ──────────────────────────────────────────────
+# free_only mode helpers (OAuth 状态管理 + 失败分类)
+# ──────────────────────────────────────────────
+
+ACCOUNT_OAUTH_STATUS_FILE = OUTPUT_DIR / "account_oauth_status.json"
+_OAUTH_TRANSIENT_COOLDOWN_S = 6 * 3600  # transient_failed 6h cooldown
+
+
+def _load_oauth_status_map() -> dict:
+    if not ACCOUNT_OAUTH_STATUS_FILE.exists():
+        return {}
+    try:
+        with open(ACCOUNT_OAUTH_STATUS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_oauth_status_map(m: dict) -> None:
+    try:
+        ACCOUNT_OAUTH_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ACCOUNT_OAUTH_STATUS_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+        tmp.replace(ACCOUNT_OAUTH_STATUS_FILE)
+    except Exception as e:
+        print(f"[free] 保存 oauth status 失败: {e}")
+
+
+def _set_account_oauth_status(email: str, status: str, fail_reason: str = "") -> None:
+    """status: pending / succeeded / dead / transient_failed"""
+    if not email:
+        return
+    m = _load_oauth_status_map()
+    m[email.lower()] = {
+        "status": status,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "fail_reason": fail_reason,
+    }
+    _save_oauth_status_map(m)
+
+
+def _get_account_oauth_status(email: str):
+    if not email:
+        return None
+    return _load_oauth_status_map().get(email.lower())
+
+
+def _should_skip_oauth_account(email: str) -> bool:
+    """True = 跳过；succeeded/dead 永跳，transient_failed 在 6h cooldown 内跳。"""
+    s = _get_account_oauth_status(email)
+    if not s:
+        return False
+    status = s.get("status", "")
+    if status in ("succeeded", "dead"):
+        return True
+    if status == "transient_failed":
+        try:
+            t = datetime.fromisoformat(s.get("ts", ""))
+            return (datetime.now(timezone.utc) - t).total_seconds() < _OAUTH_TRANSIENT_COOLDOWN_S
+        except Exception:
+            return False
+    return False
+
+
+def _load_registered_accounts() -> list:
+    if not REGISTERED_ACCOUNTS_FILE.exists():
+        return []
+    accounts = []
+    try:
+        with open(REGISTERED_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    accounts.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return accounts
+
+
+def _password_from_email(email: str) -> str:
+    """跟 browser_register 一致：local + domain（含点）；< 8 字符附加 2026OpenAI。"""
+    p = (email or "").replace("@", "")
+    if len(p) < 8:
+        p = f"{p}2026OpenAI"
+    return p
+
+
+def _classify_oauth_failure(log: str) -> str:
+    """从 _exchange_refresh_token_with_session 的 print log 推断失败原因。
+
+    优先级：account_dead > add_phone_blocked > otp_timeout >
+    consent_failed > no_callback > unknown
+    """
+    if not log:
+        return "unknown"
+    low = log.lower()
+    if "invalid_grant" in log or "no longer exists" in low or "doesn't exist" in low:
+        return "account_dead"
+    if "/add-phone" in log and "[RT] consent" not in log:
+        return "add_phone_blocked"
+    if (
+        "CF KV 等 OTP 超时" in log
+        or "OTP 获取超时" in log
+        or ("OTP" in log and "超时" in log)
+    ):
+        return "otp_timeout"
+    if "未捕获到 callback URL" in log or "callback 无 code" in log:
+        return "no_callback"
+    # OpenAI 拒绝 OAuth authorize 参数（最常见：client_id 占位符 / 失效 token）
+    if "AuthApiFailure" in log or "auth.openai.com/error?payload=" in log:
+        return "auth_api_failure"
+    if "consent" in log and "code=" not in log and "[RT] callback 无" not in log:
+        return "consent_failed"
+    return "unknown"
+
+
+def _exchange_rt_with_classification(
+    email: str, password: str, mail_cfg: dict, proxy_url: str
+):
+    """包 card._exchange_refresh_token_with_session 加失败分类。
+
+    返回 (rt, fail_reason)：rt 非空时 fail_reason 为空串。
+    print 输出 tee 到真 stdout（webui runner 能看到进度）+ 缓冲（用于 grep 分类）。
+    """
+    import io
+
+    # card.py 内部会 from cf_kv_otp_provider import ...（在 CTF-reg/）
+    # 要确保两个目录都在 sys.path，否则 OTP 路径 ImportError 立即返 ""。
+    if str(CARDW_DIR) not in sys.path:
+        sys.path.insert(0, str(CARDW_DIR))
+    if str(CARD_DIR) not in sys.path:
+        sys.path.insert(0, str(CARD_DIR))
+    import card as card_mod  # noqa: E402
+
+    class _Tee(io.TextIOBase):
+        def __init__(self, buf, real):
+            self.buf = buf
+            self.real = real
+
+        def write(self, s):
+            try:
+                self.buf.write(s)
+            except Exception:
+                pass
+            return self.real.write(s)
+
+        def flush(self):
+            try:
+                self.real.flush()
+            except Exception:
+                pass
+
+    buf = io.StringIO()
+    real_stdout = sys.stdout
+    sys.stdout = _Tee(buf, real_stdout)
+    rt = ""
+    try:
+        try:
+            rt = card_mod._exchange_refresh_token_with_session(
+                email=email,
+                password=password,
+                mail_cfg=mail_cfg,
+                proxy_url=proxy_url,
+            )
+        except Exception as e:
+            print(f"[free] _exchange_rt 异常: {e}")
+            return "", "exception"
+    finally:
+        sys.stdout = real_stdout
+
+    log = buf.getvalue()
+    if rt:
+        return rt, ""
+    return "", _classify_oauth_failure(log)
 
 
 def _read_card_cfg(path):
@@ -2286,9 +2467,24 @@ def _find_team_id_from_results(email: str) -> str:
     return ""
 
 
-def _cpa_import_after_team(email: str, sid: str, cpa_cfg: dict) -> str:
+def _cpa_import_after_team(
+    email: str,
+    sid: str,
+    cpa_cfg: dict,
+    *,
+    refresh_token: str = "",
+    is_free: bool = False,
+) -> str:
     """支付成功后把账号导入 CPA (CLIProxyAPI)。best-effort，异常不抛。
-    Returns: ok / skipped / no_rt / fail_refresh / fail_upload"""
+
+    Args:
+        refresh_token: 显式传入的 rt（free_only 路径用）；不传时从
+            output/results.jsonl 按 email/sid 查（pay 流程默认行为）。
+        is_free: True → CPA 推送 plan_tag 改用 cpa_cfg.free_plan_tag
+            （免费账号档位）；False → 用 plan_tag（team / 付费档位）。
+
+    Returns: ok / skipped / no_rt / fail_refresh / fail_upload
+    """
     import urllib.request, urllib.parse, urllib.error, base64, hashlib
     if not cpa_cfg or not cpa_cfg.get("enabled"):
         return "skipped"
@@ -2297,7 +2493,7 @@ def _cpa_import_after_team(email: str, sid: str, cpa_cfg: dict) -> str:
     if not base_url or not admin_key or not email:
         return "skipped"
 
-    rt = _find_latest_refresh_token_for_email(email, sid)
+    rt = (refresh_token or "").strip() or _find_latest_refresh_token_for_email(email, sid)
     if not rt:
         print(f"[CPA] {email} 无 refresh_token，跳过")
         return "no_rt"
@@ -2354,6 +2550,8 @@ def _cpa_import_after_team(email: str, sid: str, cpa_cfg: dict) -> str:
     }
     tag = hashlib.md5(email.encode()).hexdigest()[:8]
     plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
+    if is_free:
+        plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
     name = f"codex-{tag}-{email}-{plan_tag}.json"
     try:
         # 走 curl_cffi（chrome TLS+UA 指纹）规避 CF WAF；不可用则降级 urllib
@@ -2657,6 +2855,196 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
     return {"owner": owner_email, "team_id": team_id, "members": members_report}
 
 
+def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0):
+    """free_only mode：注册免费 ChatGPT 号 + 单独跑 OAuth 拿 rt + 推 CPA(free)。
+
+    跟 daemon/self_dealer 不同：不进入支付步骤。
+
+    count = 0 表示无限（直到 SIGTERM）；> 0 跑 count 次后退出。
+    """
+    import hashlib
+
+    card_cfg = _read_card_cfg(card_config_path)
+    cardw_path = _load_cardw_path_from_card_cfg(card_cfg, cardw_config_path)
+    cpa_cfg = (card_cfg or {}).get("cpa") or {}
+    mail_cfg = card_cfg.get("mail") or {}
+    proxy_url = card_cfg.get("proxy", "")
+
+    # 启 gost（如果配了 webshare）
+    _ensure_gost_alive(card_cfg)
+
+    # OAuth Codex client_id：card.py:_exchange_refresh_token_with_session 读
+    # OAUTH_CODEX_CLIENT_ID env var；从 cpa.oauth_client_id 推过去（subprocess
+    # 调用 card 模块时该 env 必须已设，否则 OpenAI 返 AuthApiFailure）。
+    _client_id = (cpa_cfg.get("oauth_client_id") or "").strip()
+    if _client_id and not os.environ.get("OAUTH_CODEX_CLIENT_ID"):
+        os.environ["OAUTH_CODEX_CLIENT_ID"] = _client_id
+        print(f"[free] 自动设 OAUTH_CODEX_CLIENT_ID = {_client_id}")
+
+    # 域池
+    pool = _build_domain_pool_from_cardw(cardw_path)
+
+    print(
+        f"[free-register] start count={count or '∞'} "
+        f"cpa.enabled={cpa_cfg.get('enabled')} "
+        f"proxy={proxy_url or '<none>'}"
+    )
+
+    succeeded = failed = 0
+    iteration = 0
+    while True:
+        iteration += 1
+        if count > 0 and iteration > count:
+            break
+
+        print(f"\n=== [free-register] {iteration}/{count or '∞'} ===")
+
+        picked_domain = pool.pick() if pool and (pool.domains or pool.provisioner) else ""
+        temp_cardw = None
+        effective_cardw = cardw_path
+        if picked_domain:
+            temp_cardw = _rewrite_cardw_with_domain(cardw_path, picked_domain, "")
+            effective_cardw = temp_cardw
+            pool.mark_used(picked_domain)
+            print(f"[free-register] 用域: {picked_domain}")
+
+        try:
+            try:
+                reg = register(effective_cardw)
+            except RegistrationError as e:
+                print(f"[free-register] {iteration} 注册失败: {e}")
+                failed += 1
+                time.sleep(5)
+                continue
+
+            email = reg.get("email", "")
+            password = reg.get("password") or _password_from_email(email)
+            sid = reg.get("device_id", "") or hashlib.md5(email.encode()).hexdigest()[:16]
+
+            rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+
+            if rt:
+                print(f"[free] [{iteration}] register {email} → succeeded rt_len={len(rt)}")
+                _set_account_oauth_status(email, "succeeded")
+                if cpa_cfg.get("enabled"):
+                    cpa_st = _cpa_import_after_team(
+                        email, sid, cpa_cfg, refresh_token=rt, is_free=True,
+                    )
+                    print(f"[free] [{iteration}] cpa({email}) → {cpa_st}")
+                succeeded += 1
+            else:
+                if fail == "account_dead":
+                    _set_account_oauth_status(email, "dead", fail)
+                    print(f"[free] [{iteration}] register {email} → dead ({fail})")
+                else:
+                    _set_account_oauth_status(email, "transient_failed", fail)
+                    print(f"[free] [{iteration}] register {email} → transient_failed ({fail})")
+                failed += 1
+        finally:
+            if temp_cardw and os.path.exists(temp_cardw):
+                try:
+                    os.unlink(temp_cardw)
+                except Exception:
+                    pass
+
+        time.sleep(5)
+
+    print(f"\n[free-register] 完成 succeeded={succeeded} failed={failed}")
+
+
+def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
+    """free_only mode：读 registered_accounts.jsonl 给老号补 rt + 推 CPA(free)。
+
+    跳过：已有 refresh_token / oauth_status==succeeded / oauth_status==dead /
+    transient_failed 在 6h cooldown 内的账号。
+    """
+    import hashlib
+
+    card_cfg = _read_card_cfg(card_config_path)
+    cpa_cfg = (card_cfg or {}).get("cpa") or {}
+    mail_cfg = card_cfg.get("mail") or {}
+    proxy_url = card_cfg.get("proxy", "")
+
+    _ensure_gost_alive(card_cfg)
+
+    # OAuth Codex client_id（同 free_register_loop，避免 AuthApiFailure）
+    _client_id = (cpa_cfg.get("oauth_client_id") or "").strip()
+    if _client_id and not os.environ.get("OAUTH_CODEX_CLIENT_ID"):
+        os.environ["OAUTH_CODEX_CLIENT_ID"] = _client_id
+        print(f"[free] 自动设 OAUTH_CODEX_CLIENT_ID = {_client_id}")
+
+    accounts = _load_registered_accounts()
+    if not accounts:
+        print("[free-backfill] registered_accounts.jsonl 为空，无可处理账号")
+        return
+
+    todo = []
+    skip_has_rt = skip_succeeded = skip_dead = skip_cooldown = 0
+    seen_emails = set()
+    for acc in accounts:
+        email = (acc.get("email") or "").strip()
+        if not email or email.lower() in seen_emails:
+            continue
+        seen_emails.add(email.lower())
+        if acc.get("refresh_token"):
+            skip_has_rt += 1
+            continue
+        s = _get_account_oauth_status(email)
+        if s:
+            status = s.get("status", "")
+            if status == "succeeded":
+                skip_succeeded += 1
+                continue
+            if status == "dead":
+                skip_dead += 1
+                continue
+            if status == "transient_failed" and _should_skip_oauth_account(email):
+                skip_cooldown += 1
+                continue
+        todo.append(acc)
+
+    print(
+        f"[free-backfill] 共 {len(accounts)} 账号, todo={len(todo)} "
+        f"(skip: has_rt={skip_has_rt} succeeded={skip_succeeded} "
+        f"dead={skip_dead} cooldown={skip_cooldown})"
+    )
+
+    if not todo:
+        return
+
+    succeeded = failed = 0
+    for i, acc in enumerate(todo, 1):
+        email = acc.get("email", "")
+        password = acc.get("password") or _password_from_email(email)
+        sid = acc.get("device_id", "") or hashlib.md5(email.encode()).hexdigest()[:16]
+
+        print(f"\n=== [free-backfill] [{i}/{len(todo)}] {email} ===")
+
+        rt, fail = _exchange_rt_with_classification(email, password, mail_cfg, proxy_url)
+
+        if rt:
+            print(f"[free] [{i}/{len(todo)}] backfill {email} → succeeded rt_len={len(rt)}")
+            _set_account_oauth_status(email, "succeeded")
+            if cpa_cfg.get("enabled"):
+                cpa_st = _cpa_import_after_team(
+                    email, sid, cpa_cfg, refresh_token=rt, is_free=True,
+                )
+                print(f"[free] [{i}/{len(todo)}] cpa({email}) → {cpa_st}")
+            succeeded += 1
+        else:
+            if fail == "account_dead":
+                _set_account_oauth_status(email, "dead", fail)
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → dead ({fail})")
+            else:
+                _set_account_oauth_status(email, "transient_failed", fail)
+                print(f"[free] [{i}/{len(todo)}] backfill {email} → transient_failed ({fail})")
+            failed += 1
+
+        time.sleep(3)
+
+    print(f"\n[free-backfill] 完成 succeeded={succeeded} failed={failed}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Pipeline: ChatGPT 注册 → Stripe/PayPal 支付",
@@ -2696,13 +3084,29 @@ def main():
                         help="自产自销：1 个 owner 付费开 Team + N 个 member 邀请上车 + 全部推 CPA")
     parser.add_argument("--self-dealer-resume", default="", metavar="OWNER_EMAIL",
                         help="自产自销 resume 模式：跳过 Step 1，用已注册付费过的 owner（从 results.jsonl 读 team_id + rt）")
+    parser.add_argument("--free-register", action="store_true",
+                        help="free_only 模式：循环注册免费 ChatGPT 号 + OAuth 拿 rt + 推 CPA(free)")
+    parser.add_argument("--free-backfill-rt", action="store_true",
+                        help="free_only 模式：读 registered_accounts.jsonl 给老号补 rt + 推 CPA(free)，跳过已 succeeded/dead")
+    parser.add_argument("--count", type=int, default=0, metavar="N",
+                        help="--free-register 模式下注册 N 次后退出（0 = 无限）")
     args = parser.parse_args()
 
     if args.paypal and args.gopay:
         print("[ERROR] --paypal 与 --gopay 互斥", file=sys.stderr)
         sys.exit(2)
+    if args.free_register and args.free_backfill_rt:
+        print("[ERROR] --free-register 与 --free-backfill-rt 互斥", file=sys.stderr)
+        sys.exit(2)
 
     try:
+        if args.free_register:
+            free_register_loop(args.config, cardw_config_path=args.cardw_config,
+                                count=args.count)
+            return
+        if args.free_backfill_rt:
+            free_backfill_rt_loop(args.config, cardw_config_path=args.cardw_config)
+            return
         if args.daemon:
             daemon(args.config, cardw_config_path=args.cardw_config, use_paypal=args.paypal)
             return

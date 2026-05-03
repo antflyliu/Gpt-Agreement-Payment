@@ -39,18 +39,24 @@
           <div v-if="form.mode === 'self_dealer'" class="ctl-row sub">
             <TermField v-model.number="form.self_dealer" label="member N" type="number" />
           </div>
+          <div v-if="form.mode === 'free_register'" class="ctl-row sub">
+            <TermField v-model.number="form.count" label="注册数 (0=无限)" type="number" />
+          </div>
 
-          <div class="ctl-row toggles">
+          <div v-if="!isFreeMode" class="ctl-row toggles">
             <TermToggle v-model="form.paypal" :disabled="form.gopay">PayPal 支付</TermToggle>
             <TermToggle v-model="form.gopay" @update:modelValue="onGoPayToggle">GoPay (印尼)</TermToggle>
           </div>
-          <div class="ctl-row toggles">
+          <div v-if="!isFreeMode" class="ctl-row toggles">
             <TermToggle v-model="form.pay_only">--pay-only</TermToggle>
             <TermToggle v-model="form.register_only" :disabled="form.pay_only">--register-only</TermToggle>
           </div>
-          <p class="ctl-hint">
+          <p v-if="!isFreeMode" class="ctl-hint">
             <code>--pay-only</code> 跳过注册，复用 config 里的 session_token；
             <code>--register-only</code> 只注册不支付。
+          </p>
+          <p v-else class="ctl-hint">
+            <code>{{ form.mode }}</code> 不走支付步骤；OTP 经 CF KV 取，OAuth 拿 rt 后推 CPA 用 <code>cpa.free_plan_tag</code>。
           </p>
         </div>
 
@@ -142,6 +148,8 @@ const modes = [
   { value: "batch", label: "batch — N×" },
   { value: "self_dealer", label: "self-dealer" },
   { value: "daemon", label: "daemon ∞" },
+  { value: "free_register", label: "free_register — 免费号+rt+CPA" },
+  { value: "free_backfill_rt", label: "free_backfill_rt — 老号补rt" },
 ];
 
 import { useWizardStore } from "../stores/wizard";
@@ -168,6 +176,7 @@ const form = ref({
   batch: 5,
   workers: 3,
   self_dealer: 4,
+  count: 0, // free_register 模式：注册多少个后停（0 = 无限）
 });
 
 const otpDialog = ref({ open: false, value: "", submitting: false });
@@ -331,8 +340,12 @@ async function submitOtp() {
   }
 }
 
+const isFreeMode = computed(() =>
+  form.value.mode === "free_register" || form.value.mode === "free_backfill_rt"
+);
+
 watch(
-  () => [form.value.mode, form.value.paypal, form.value.gopay, form.value.pay_only, form.value.register_only, form.value.batch, form.value.workers, form.value.self_dealer],
+  () => [form.value.mode, form.value.paypal, form.value.gopay, form.value.pay_only, form.value.register_only, form.value.batch, form.value.workers, form.value.self_dealer, form.value.count],
   refreshPreview,
   { immediate: false }
 );
