@@ -105,7 +105,14 @@ git clone https://github.com/DanOps-1/Gpt-Agreement-Payment
 cd Gpt-Agreement-Payment
 pip install requests curl_cffi playwright camoufox browserforge mitmproxy pybase64
 playwright install firefox
+
+
+python -m pip install -U "camoufox[geoip]"
+
+sudo apt install -y libgtk-3-0 libx11-xcb1 libasound2t64
+
 camoufox fetch
+
 ```
 
 hCaptcha 求解器的 ML 依赖（torch / transformers / opencv）建议单独装到 venv，约 4 GB：
@@ -131,6 +138,15 @@ cp CTF-reg/config.paypal-proxy.example.json   CTF-reg/config.paypal-proxy.json
 ### 跑
 
 ```bash
+# wsl 中安装 xvfb
+sudo apt update
+sudo apt install -y xvfb xauth
+# 验证
+which xvfb-run
+xvfb-run --help
+xvfb-run -a echo "xvfb-run OK"
+# Windows 环境配置，创建脚本位置： D:\INSTALLED\WSL\bin\xvfb-run.cmd
+
 # 单次完整流程
 xvfb-run -a python pipeline.py --config CTF-pay/config.paypal.json --paypal
 

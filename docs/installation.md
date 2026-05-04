@@ -27,6 +27,11 @@ sudo apt update && sudo apt install -y \
 sudo curl -sSfL \
     https://github.com/go-gost/gost/releases/latest/download/gost-linux-amd64 \
     -o /usr/local/bin/gost && sudo chmod +x /usr/local/bin/gost
+错误提示：curl: (22) The requested URL returned error: 404
+
+官方做法：
+sudo curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh | sudo bash -s -- --install
+
 ```
 
 ---
@@ -41,6 +46,8 @@ pip install requests curl_cffi playwright camoufox browserforge mitmproxy pybase
 
 # Playwright + Camoufox 浏览器二进制
 playwright install firefox
+npx playwright install chromium
+
 camoufox fetch
 ```
 
