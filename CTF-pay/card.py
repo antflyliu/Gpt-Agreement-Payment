@@ -44,7 +44,14 @@ except Exception:
     _HAS_CURL_CFFI = False
 
 
-_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from shared.camoufox_runtime import resolve_camoufox_geoip
+
+
+_OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "output")
 os.makedirs(os.path.join(_OUTPUT_DIR, "logs"), exist_ok=True)
 LOG_FILE = os.path.join(_OUTPUT_DIR, "logs", "card.log")
 
@@ -3589,7 +3596,8 @@ def solve_stripe_hcaptcha_in_browser(
         )
         python_candidates = [
             str(os.environ.get("CTFML_PYTHON") or "").strip(),
-            "~/.venvs/ctfml/bin/python",
+            # "~/.venvs/ctfml/bin/python",
+            "/mnt/d/WORKSPACE/ai-space/Gpt-Agreement-Payment/.venv_build/ctfml/bin/python",
             sys.executable,
         ]
         solver_python = next((p for p in python_candidates if p and os.path.exists(p)), sys.executable)
@@ -5060,7 +5068,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             os="windows",
             screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy,
-            geoip=True,
+            geoip=resolve_camoufox_geoip(_log),
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -5409,7 +5417,7 @@ def _paypal_browser_authorize(
         os="windows",
         screen=Screen(max_width=1920, max_height=1080),
         proxy=cf_proxy,
-        geoip=True,
+        geoip=resolve_camoufox_geoip(_log),
         locale="zh-CN",
     ) as ctx:
         # persistent_context 返回的是 BrowserContext 而不是 Browser
@@ -8086,7 +8094,8 @@ def run(
         bundled_solver = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hcaptcha_auto_solver.py")
         python_candidates = [
             str(os.environ.get("CTFML_PYTHON") or "").strip(),
-            "~/.venvs/ctfml/bin/python",
+            # "~/.venvs/ctfml/bin/python",
+            "/mnt/d/WORKSPACE/ai-space/Gpt-Agreement-Payment/.venv_build/ctfml/bin/python",
             sys.executable,
         ]
         solver_python = next((p for p in python_candidates if p and os.path.exists(p)), sys.executable)

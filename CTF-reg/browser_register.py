@@ -27,10 +27,61 @@ import re
 import hashlib
 import base64
 import secrets
+import sys
 from typing import Optional
 from urllib.parse import urlparse, urlencode, parse_qs
 
 logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from shared.camoufox_runtime import resolve_camoufox_geoip
+
+
+class _OtpIssueWindow:
+    def __init__(self):
+        self._issued_after: Optional[float] = None
+
+    def mark_possible_send(self) -> float:
+        self._issued_after = time.time()
+        return self._issued_after
+
+    def issued_after(self) -> float:
+        return self._issued_after if self._issued_after is not None else time.time()
+
+
+def _text_has_incorrect_otp(text: str) -> bool:
+    lowered = (text or "").lower()
+    markers = (
+        "incorrect code",
+        "invalid code",
+        "wrong code",
+        "code is incorrect",
+        "验证码不正确",
+        "验证码错误",
+        "无效验证码",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _page_has_incorrect_otp(page) -> bool:
+    try:
+        return _text_has_incorrect_otp(page.inner_text("body"))
+    except Exception:
+        return False
+
+
+def _otp_input_present(page) -> bool:
+    try:
+        return bool(
+            page.query_selector('input[autocomplete="one-time-code"]')
+            or page.query_selector('input[name="code"]')
+            or page.query_selector('input[inputmode="numeric"]')
+        )
+    except Exception:
+        return False
 
 
 def _gen_name() -> tuple[str, str]:
@@ -121,6 +172,7 @@ def browser_register(cfg, mail_provider) -> dict:
     }
 
     try:
+        otp_issue_window = _OtpIssueWindow()
         with Camoufox(
             headless=not has_display,
             humanize=True,
@@ -129,7 +181,7 @@ def browser_register(cfg, mail_provider) -> dict:
             os="windows",
             screen=Screen(max_width=1920, max_height=1080),
             proxy=cf_proxy,
-            geoip=True,
+            geoip=resolve_camoufox_geoip(logger),
             locale="en-US",
         ) as ctx:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -230,6 +282,7 @@ def browser_register(cfg, mail_provider) -> dict:
                         'button:has-text("Next")']:
                 b = page.query_selector(sel)
                 if b and b.is_visible():
+                    otp_issue_window.mark_possible_send()
                     b.click()
                     logger.info(f"[browser-reg] 点击 email 继续: {sel}")
                     break
@@ -252,6 +305,7 @@ def browser_register(cfg, mail_provider) -> dict:
                             'button:has-text("Create")', 'button:has-text("Next")']:
                     b = page.query_selector(sel)
                     if b and b.is_visible():
+                        otp_issue_window.mark_possible_send()
                         b.click()
                         logger.info(f"[browser-reg] 点击 password 继续: {sel}")
                         break
@@ -280,49 +334,95 @@ def browser_register(cfg, mail_provider) -> dict:
                     logger.info(f"[browser-reg] 15s 等待中: {cur[:80]}")
 
             # [5] OTP 步骤
-            if page.query_selector('input[autocomplete="one-time-code"]') or \
-               page.query_selector('input[inputmode="numeric"]'):
-                logger.info("[browser-reg] 等待 IMAP OTP ...")
-                otp_sent_at = time.time()
+            if _otp_input_present(page):
+                otp_sent_at = otp_issue_window.issued_after()
+                logger.info(
+                    f"[browser-reg] 等待邮箱 OTP ... issued_after={otp_sent_at:.0f}"
+                )
                 try:
                     otp_timeout = max(30, int(os.getenv("OTP_TIMEOUT", "180")))
                 except Exception:
                     otp_timeout = 180
-                otp_code = mail_provider.wait_for_otp(email, timeout=otp_timeout, issued_after=otp_sent_at)
-                logger.info(f"[browser-reg] 收到 OTP: {otp_code}")
-                # 填 OTP
-                otp_filled = False
-                # 可能是单框 / 多框两种
-                single = page.query_selector('input[autocomplete="one-time-code"]') or \
-                         page.query_selector('input[name="code"]') or \
-                         page.query_selector('input[inputmode="numeric"]:not([maxlength="1"])')
-                if single:
-                    single.click()
-                    time.sleep(0.3)
-                    single.fill(otp_code)
-                    otp_filled = True
-                else:
-                    digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
-                             page.query_selector_all('input[maxlength="1"]')
-                    if len(digits) >= 6:
-                        for i, ch in enumerate(otp_code[:6]):
-                            digits[i].click()
-                            time.sleep(0.1)
-                            digits[i].fill(ch)
+
+                def _fill_current_otp(otp_code: str) -> None:
+                    otp_filled = False
+                    # 可能是单框 / 多框两种
+                    single = page.query_selector('input[autocomplete="one-time-code"]') or \
+                             page.query_selector('input[name="code"]') or \
+                             page.query_selector('input[inputmode="numeric"]:not([maxlength="1"])')
+                    if single:
+                        single.click()
+                        time.sleep(0.3)
+                        single.fill(otp_code)
                         otp_filled = True
-                if not otp_filled:
-                    page.screenshot(path="/tmp/browser_reg_otp_fail.png")
-                    raise RuntimeError("OTP 输入框未找到")
-                time.sleep(0.8)
-                # Continue
-                for sel in ['button[type="submit"]', 'button:has-text("Continue")',
-                            'button:has-text("Verify")', 'button:has-text("Next")']:
-                    b = page.query_selector(sel)
-                    if b and b.is_visible():
-                        b.click()
-                        logger.info(f"[browser-reg] 点击 OTP 继续: {sel}")
+                    else:
+                        digits = page.query_selector_all('input[maxlength="1"][inputmode="numeric"]') or \
+                                 page.query_selector_all('input[maxlength="1"]')
+                        if len(digits) >= 6:
+                            for i, ch in enumerate(otp_code[:6]):
+                                digits[i].click()
+                                time.sleep(0.1)
+                                digits[i].fill(ch)
+                            otp_filled = True
+                    if not otp_filled:
+                        page.screenshot(path="/tmp/browser_reg_otp_fail.png")
+                        raise RuntimeError("OTP 输入框未找到")
+
+                def _submit_current_otp() -> None:
+                    for sel in ['button[type="submit"]', 'button:has-text("Continue")',
+                                'button:has-text("Verify")', 'button:has-text("Next")']:
+                        b = page.query_selector(sel)
+                        if b and b.is_visible():
+                            b.click()
+                            logger.info(f"[browser-reg] 点击 OTP 继续: {sel}")
+                            return
+                    raise RuntimeError("OTP Continue 按钮未找到")
+
+                def _click_resend_otp() -> bool:
+                    for sel in ['button:has-text("Resend email")',
+                                'a:has-text("Resend email")',
+                                'button:has-text("Resend")',
+                                'a:has-text("Resend")']:
+                        try:
+                            b = page.query_selector(sel)
+                            if b and b.is_visible():
+                                otp_issue_window.mark_possible_send()
+                                b.click()
+                                logger.info(f"[browser-reg] 点击重发 OTP: {sel}")
+                                return True
+                        except Exception:
+                            continue
+                    return False
+
+                try:
+                    max_otp_attempts = max(1, int(os.getenv("OTP_VERIFY_ATTEMPTS", "2")))
+                except Exception:
+                    max_otp_attempts = 2
+
+                for otp_attempt in range(1, max_otp_attempts + 1):
+                    otp_code = mail_provider.wait_for_otp(
+                        email,
+                        timeout=otp_timeout,
+                        issued_after=otp_sent_at,
+                    )
+                    logger.info(f"[browser-reg] 收到 OTP: {otp_code} attempt={otp_attempt}/{max_otp_attempts}")
+                    _fill_current_otp(otp_code)
+                    time.sleep(0.8)
+                    _submit_current_otp()
+                    time.sleep(4)
+
+                    if not _page_has_incorrect_otp(page):
                         break
-                time.sleep(4)
+
+                    page.screenshot(path=f"/tmp/browser_reg_otp_incorrect_{otp_attempt}.png")
+                    if otp_attempt >= max_otp_attempts:
+                        raise RuntimeError("OTP 校验失败: 页面提示 Incorrect code")
+
+                    logger.warning("[browser-reg] OTP 被页面判定错误，重发邮件后重试")
+                    if not _click_resend_otp():
+                        raise RuntimeError("OTP 校验失败，且未找到 Resend email 按钮")
+                    otp_sent_at = otp_issue_window.issued_after()
+                    time.sleep(2)
 
             # [6] /about-you：Full name + Age（单框）
             logger.info(f"[browser-reg] OTP 后 URL: {page.url[:120]}")

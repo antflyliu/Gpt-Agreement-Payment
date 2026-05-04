@@ -49,7 +49,7 @@ class CloudflareKVOtpProvider:
         account_id: str,
         kv_namespace_id: str,
         poll_interval_s: float = 1.0,
-        delete_after_read: bool = True,
+        delete_after_read: bool = False,
     ):
         self.token = api_token
         self.account_id = account_id
@@ -230,7 +230,9 @@ class CloudflareKVOtpProvider:
                     logger.info(
                         f"[CF-KV] 收到 OTP={otp} key={key} "
                         f"poll#{polls} elapsed={elapsed:.1f}s "
-                        f"from={payload.get('from','?')[:60]!r}"
+                        f"ts={ts_s:.0f} "
+                        f"from={payload.get('from','?')[:60]!r} "
+                        f"subject={payload.get('subject','?')[:80]!r}"
                     )
                     if self.delete_after_read:
                         self._kv_delete(key)
