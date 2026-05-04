@@ -120,6 +120,65 @@ def _describe_challenge_artifact(name: str, value: str) -> str:
     return f"{name}: prefix={prefix!r} len={len(value)}"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, value)
+
+
+def _paypal_ddc_manual_handoff_enabled(has_display: bool) -> bool:
+    """Only pause for manual DataDome handling when the browser is visible."""
+    return has_display and _env_flag("CARD_PAYPAL_DDC_MANUAL_HANDOFF", True)
+
+
+def _paypal_ddc_auto_drag_enabled() -> bool:
+    """Auto-drag is the default path; set CARD_PAYPAL_DDC_AUTO_DRAG=0 to disable."""
+    return _env_flag("CARD_PAYPAL_DDC_AUTO_DRAG", True)
+
+
+def _paypal_ddc_continuation_ready(page) -> bool:
+    cur = getattr(page, "url", "") or ""
+    if any(
+        kw in cur
+        for kw in (
+            "/signin",
+            "/authflow",
+            "/webapps/hermes",
+            "checkoutweb",
+            "/pay",
+            "chatgpt.com",
+            "pm-redirects",
+        )
+    ):
+        return True
+    for selector in ('input[name="login_email"]', "#consentButton", "button#consentButton"):
+        try:
+            element = page.query_selector(selector)
+        except Exception:
+            element = None
+        if not element:
+            continue
+        try:
+            if hasattr(element, "is_visible") and not element.is_visible():
+                continue
+        except Exception:
+            pass
+        return True
+    return False
+
+
 class ChallengeReconfirmRequired(RuntimeError):
     """当前 challenge 已失效或被拒，需要重新 confirm 获取新的 challenge。"""
     pass
@@ -5665,16 +5724,54 @@ def _paypal_browser_authorize(
                     time.sleep(random.uniform(1.0, 2.0))
                 return False
 
+            def _wait_for_manual_ddc_completion(context: str) -> bool:
+                """Pause visible browser flow so the operator can complete DDC manually."""
+                if not _paypal_ddc_manual_handoff_enabled(has_display):
+                    return False
+                timeout_s = _env_int("CARD_PAYPAL_DDC_MANUAL_TIMEOUT_SECONDS", 1800)
+                _safe_screenshot(page, "/tmp/paypal_ddc_manual_handoff.png")
+                _log(
+                    f"      [{context}] PayPal DataDome 需要人工处理；"
+                    f"请在已打开的浏览器窗口中完成验证，最长等待 {timeout_s}s"
+                )
+                _log("CARD_DATADOME_MANUAL_HANDOFF=1")
+                deadline = time.monotonic() + timeout_s
+                next_diag = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    time.sleep(2)
+                    if (not _slider_visible()) and _paypal_ddc_continuation_ready(page):
+                        _log(f"      [{context}] 人工处理完成，继续流程 → {page.url[:100]}")
+                        return True
+                    now = time.monotonic()
+                    if now >= next_diag:
+                        _safe_screenshot(page, "/tmp/paypal_ddc_manual_wait.png")
+                        _log(f"      [{context}] 仍在等待人工完成 DataDome: {page.url[:100]}")
+                        next_diag = now + 30
+                _safe_screenshot(page, "/tmp/paypal_ddc_manual_timeout.png")
+                _log(f"      [{context}] 人工处理 DataDome 超时: {page.url[:100]}")
+                return False
+
             slider_visible = _slider_visible()
             if slider_visible:
                 _safe_screenshot(page, "/tmp/paypal_ddc_slider.png")
-                _log("      [B-DDC] 检测到可见滑块，尝试 drag solver ...")
-                if _try_solve_ddc_slider(attempts=2):
-                    _log("      [B-DDC] drag solver 成功，继续流程")
+                if _paypal_ddc_auto_drag_enabled():
+                    _log("      [B-DDC] 检测到可见滑块，尝试 drag solver ...")
+                    if _try_solve_ddc_slider(attempts=2):
+                        _log("      [B-DDC] drag solver 成功，继续流程")
+                    elif _wait_for_manual_ddc_completion("B-DDC"):
+                        _log("      [B-DDC] 人工完成 DataDome，继续流程")
+                    else:
+                        _log("      [B-DDC] drag solver 失败，发 marker 交给外层")
+                        _log("CARD_DATADOME_SLIDER=1")
+                        raise RuntimeError("DataDome 滑块 solver 失败")
                 else:
-                    _log("      [B-DDC] drag solver 失败，发 marker 交给外层")
-                    _log("CARD_DATADOME_SLIDER=1")
-                    raise RuntimeError("DataDome 滑块 solver 失败")
+                    # 自动拖拽被禁用时，直接走人工接管
+                    if _wait_for_manual_ddc_completion("B-DDC"):
+                        _log("      [B-DDC] 人工完成 DataDome，继续流程")
+                    else:
+                        _log("      [B-DDC] DataDome 需要人工完成，但当前没有可用显示窗口")
+                        _log("CARD_DATADOME_SLIDER=1")
+                        raise RuntimeError("DataDome 需要人工完成")
             if ddc_frame:
                 _log("      [B-DDC] 检测到 DDC 隐形挑战，等待自然通过 ...")
                 _safe_screenshot(page, "/tmp/paypal_ddc_detected.png")
@@ -5692,9 +5789,16 @@ def _paypal_browser_authorize(
                     # 中途升级到可见滑块的情况
                     if _slider_visible():
                         _safe_screenshot(page, "/tmp/paypal_ddc_slider.png")
-                        _log("      [B-DDC] 等待中升级为可见滑块，中止以便外层换 IP")
+                        if _paypal_ddc_auto_drag_enabled():
+                            _log("      [B-DDC] 等待中升级为可见滑块，尝试 drag solver ...")
+                            if _try_solve_ddc_slider(attempts=2):
+                                _log("      [B-DDC] drag solver 成功，继续等待")
+                                continue
+                        if _wait_for_manual_ddc_completion("B-DDC"):
+                            break
+                        _log("      [B-DDC] 等待中升级为可见滑块，需人工完成")
                         _log("CARD_DATADOME_SLIDER=1")
-                        raise RuntimeError("DataDome 可见滑块，放弃当前 IP")
+                        raise RuntimeError("DataDome 需要人工完成")
                     # 如果出现"重试"按钮，点击它刷新
                     retry_btn = page.query_selector('button:has-text("重试")') or \
                                 page.query_selector('button:has-text("Retry")')
@@ -6060,16 +6164,38 @@ def _paypal_browser_authorize(
                                            "captcha" in (f.url or "") or
                                            "datadome" in (f.url or ""))
                                           for f in page.frames if f.url != cur)
-                    if _slider_visible() or (wait_i >= 15 and ddc_frame_now):
+                    visible_slider_now = _slider_visible()
+                    if visible_slider_now:
                         _safe_screenshot(page, "/tmp/paypal_ddc_slider.png")
-                        reason = "关键字匹配" if _slider_visible() else "agreements 原地转+DDC iframe"
-                        _log(f"      [B6] 检到可见滑块 ({reason})，尝试 drag solver ...")
-                        if _try_solve_ddc_slider(attempts=2):
-                            _log("      [B6] drag solver 成功，继续等 hermes")
+                        if _paypal_ddc_auto_drag_enabled():
+                            _log("      [B6] 检到可见滑块，尝试 drag solver ...")
+                            if _try_solve_ddc_slider(attempts=2):
+                                _log("      [B6] drag solver 成功，继续等 hermes")
+                                continue
+                        if _wait_for_manual_ddc_completion("B6"):
+                            _log("      [B6] 人工完成 DataDome，继续等 hermes")
                             continue
-                        _log("      [B6] drag solver 失败，发 marker 交给外层")
+                        _log("      [B6] DataDome 需要人工完成，但当前没有可用显示窗口")
                         _log("CARD_DATADOME_SLIDER=1")
-                        raise RuntimeError("DataDome 滑块 solver 失败")
+                        raise RuntimeError("DataDome 需要人工完成")
+                    if wait_i >= 15 and ddc_frame_now:
+                        if wait_i == 15:
+                            _safe_screenshot(page, "/tmp/paypal_ddc_iframe_wait.png")
+                            _log(
+                                "      [B6] agreements 页面仍有 DDC iframe；"
+                                "如果浏览器中出现验证，请人工完成，程序会继续等待"
+                            )
+                        if _paypal_ddc_manual_handoff_enabled(has_display):
+                            if _wait_for_manual_ddc_completion("B6"):
+                                _log("      [B6] DataDome 状态已解除，继续等 hermes")
+                                continue
+                            _log("      [B6] 人工处理 DataDome 超时")
+                            _log("CARD_DATADOME_SLIDER=1")
+                            raise RuntimeError("DataDome 人工处理超时")
+                        if wait_i >= 25:
+                            _log("      [B6] DDC iframe 未自然解除，且当前无可见浏览器人工接管")
+                            _log("CARD_DATADOME_SLIDER=1")
+                            raise RuntimeError("DataDome 需要可见浏览器人工完成")
                 if wait_i == 15:
                     _safe_screenshot(page, "/tmp/paypal_b6_wait.png")
                     _log(f"      [B6-diag] 15s URL: {cur[:100]}")
