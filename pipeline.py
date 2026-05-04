@@ -13,7 +13,7 @@ Pipeline 调度器：注册 ChatGPT 账号 → Stripe/PayPal 支付
   # 仅注册
   python pipeline.py --register-only --cardw-config CTF-reg/config.paypal-proxy.json
 
-  # 仅支付 (已有 session_token)
+  # 仅支付 (优先复用 SQLite 数据库里最近未支付账号)
   python pipeline.py --pay-only --config CTF-pay/config.paypal.json --paypal
 
   # 批量
@@ -32,6 +32,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from webui.backend.db import get_db
+
 ROOT = Path(__file__).resolve().parent
 CARDW_DIR = ROOT / "CTF-reg"
 CARD_DIR = ROOT / "CTF-pay"
@@ -39,10 +41,10 @@ CARD_PY = CARD_DIR / "card.py"
 GOPAY_PY = CARD_DIR / "gopay.py"
 OUTPUT_DIR = ROOT / "output"
 (OUTPUT_DIR / "logs").mkdir(parents=True, exist_ok=True)
-RESULTS_FILE = OUTPUT_DIR / "pipeline_batch.jsonl"
-CARD_RESULTS_FILE = OUTPUT_DIR / "results.jsonl"
-DOMAIN_STATE_FILE = OUTPUT_DIR / "email_domain_state.json"
-REGISTERED_ACCOUNTS_FILE = OUTPUT_DIR / "registered_accounts.jsonl"
+DOMAIN_STATE_KEY = "email_domain_state"
+DAEMON_STATE_KEY = "daemon_state"
+SECRETS_KEY = "secrets"
+RUNTIME_DB_FILE = OUTPUT_DIR / "webui.db"
 
 
 # ──────────────────────────────────────────────
@@ -244,34 +246,30 @@ class DomainPool:
     """持久化邮箱域状态：ok / burned (带 cooldown)。支付后拿 invite 探测结果反馈更新。
     可选 provisioner：当可用域 < min_available 时，通过 Cloudflare API 按需开通新子域。"""
 
-    def __init__(self, domains, state_file=DOMAIN_STATE_FILE, cooldown_hours=24,
+    def __init__(self, domains, state_key=DOMAIN_STATE_KEY, cooldown_hours=24,
                  provisioner: "CloudflareDomainProvisioner" = None, min_available: int = 2):
         self.domains = [d.strip() for d in (domains or []) if d and d.strip()]
-        self.state_file = Path(state_file)
+        self.state_key = str(state_key or DOMAIN_STATE_KEY)
         self.cooldown_s = max(0, int(cooldown_hours)) * 3600
         self.state = self._load()
         self.provisioner = provisioner
         self.min_available = max(1, int(min_available))
 
     def _load(self):
-        if not self.state_file.exists():
-            return {"domains": {}}
         try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = get_db().get_runtime_json(self.state_key, {"domains": {}})
             if not isinstance(data, dict) or "domains" not in data:
                 return {"domains": {}}
             return data
         except Exception as e:
-            print(f"[DomainPool] 读状态失败: {e}，重建")
+            print(f"[DomainPool] 读数据库状态失败: {e}，重建")
             return {"domains": {}}
 
     def _save(self):
         try:
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(self.state, f, ensure_ascii=False, indent=2)
+            get_db().set_runtime_json(self.state_key, self.state)
         except Exception as e:
-            print(f"[DomainPool] 存状态失败: {e}")
+            print(f"[DomainPool] 存数据库状态失败: {e}")
 
     def _is_available(self, domain, now_ts):
         meta = self.state["domains"].get(domain, {})
@@ -650,13 +648,10 @@ print("LOCALAUTH_RESULT_JSON=" + json.dumps(result.to_dict(), ensure_ascii=False
 
     email = result_json.get("email", "?")
     print(f"[register] 注册成功: {email}")
-    # 持久化完整凭证到 output/registered_accounts.jsonl (供后续测试/邀请使用)
     try:
-        accounts_file = REGISTERED_ACCOUNTS_FILE
         entry = dict(result_json)
         entry["ts"] = datetime.now(timezone.utc).isoformat()
-        with open(accounts_file, "a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        get_db().add_registered_account(entry)
     except Exception as e:
         print(f"[register] 保存凭证失败: {e}")
     return result_json
@@ -675,6 +670,63 @@ class DatadomeSliderError(PaymentError):
     pass
 
 
+def _codex_oauth_client_id_from_card_cfg(cfg: dict) -> str:
+    """Resolve Codex OAuth client_id for child card.py processes.
+
+    `card.py` needs a real client_id to finish the post-payment Codex OAuth
+    flow and obtain refresh_token.  Prefer the WebUI/CPA field because that is
+    where this project already stores the downstream Codex client id.  Literal
+    placeholders are ignored.
+    """
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cpa_cfg = cfg.get("cpa") or {}
+    fresh_cfg = cfg.get("fresh_checkout") or {}
+    auth_cfg = fresh_cfg.get("auth") or {}
+    for value in (
+        (cpa_cfg or {}).get("oauth_client_id", ""),
+        cfg.get("oauth_client_id", ""),
+        cfg.get("codex_oauth_client_id", ""),
+        auth_cfg.get("oauth_client_id", ""),
+    ):
+        client_id = str(value or "").strip()
+        if not client_id:
+            continue
+        if client_id.startswith("YOUR_") or client_id.endswith("_CLIENT_ID"):
+            continue
+        return client_id
+    return ""
+
+
+def _cpa_cfg_for_card_payment(card_cfg: dict) -> dict:
+    """Return CPA config adjusted to the configured paid product.
+
+    Older WebUI exports used `cpa.plan_tag=team` globally.  GoPay is used here
+    for ChatGPT Plus, so importing a Plus account with a `team` suffix is
+    misleading downstream.  Unless `auto_plan_tag` is explicitly disabled,
+    derive a safer tag from fresh_checkout.plan.
+    """
+    if not isinstance(card_cfg, dict):
+        return {}
+    cpa_cfg = dict(card_cfg.get("cpa") or {})
+    if not cpa_cfg:
+        return cpa_cfg
+    if cpa_cfg.get("auto_plan_tag", True) is False:
+        return cpa_cfg
+    plan_cfg = (card_cfg.get("fresh_checkout") or {}).get("plan") or {}
+    plan_name = str(plan_cfg.get("plan_name") or "").lower()
+    plan_type = str(plan_cfg.get("plan_type") or "").lower()
+    if "plus" in plan_name or plan_type == "plus":
+        cpa_cfg["plan_tag"] = (cpa_cfg.get("plus_plan_tag") or "plus").strip() or "plus"
+    elif "team" in plan_name or plan_type == "team":
+        cpa_cfg["plan_tag"] = (
+            cpa_cfg.get("team_plan_tag")
+            or cpa_cfg.get("plan_tag")
+            or "team"
+        ).strip() or "team"
+    return cpa_cfg
+
+
 def pay(card_config_path, session_token=None, access_token=None,
         device_id=None, use_paypal=False, use_gopay=False,
         gopay_otp_file=None, python="python3", timeout=600):
@@ -690,6 +742,7 @@ def pay(card_config_path, session_token=None, access_token=None,
         raise PaymentError("use_paypal 与 use_gopay 互斥")
 
     card_config_path = str(Path(card_config_path).resolve())
+    cfg_for_env = {}
 
     # 如果有外部凭证，创建临时配置
     config_to_use = card_config_path
@@ -697,6 +750,7 @@ def pay(card_config_path, session_token=None, access_token=None,
     if session_token or access_token:
         with open(card_config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+        cfg_for_env = cfg
         auth = cfg.setdefault("fresh_checkout", {}).setdefault("auth", {})
         auth["mode"] = "access_token"
         if session_token:
@@ -718,6 +772,12 @@ def pay(card_config_path, session_token=None, access_token=None,
         json.dump(cfg, tmp_config, ensure_ascii=False, indent=2)
         tmp_config.close()
         config_to_use = tmp_config.name
+    else:
+        try:
+            with open(card_config_path, "r", encoding="utf-8") as f:
+                cfg_for_env = json.load(f)
+        except Exception:
+            cfg_for_env = {}
 
     cmd = [python, str(CARD_PY), "auto",
            "--config", config_to_use, "--json-result"]
@@ -733,6 +793,10 @@ def pay(card_config_path, session_token=None, access_token=None,
     env = dict(os.environ)
     env.pop("HTTP_PROXY", None)
     env.pop("HTTPS_PROXY", None)
+    if not env.get("OAUTH_CODEX_CLIENT_ID"):
+        client_id = _codex_oauth_client_id_from_card_cfg(cfg_for_env)
+        if client_id:
+            env["OAUTH_CODEX_CLIENT_ID"] = client_id
 
     print(f"[pay] 启动支付 (mode={mode_label}) ...")
 
@@ -882,7 +946,7 @@ def pipeline(card_config_path, cardw_config_path=None, use_paypal=False,
                 record["invite_permission"] = "error"
 
         # Step 4: 支付成功 → 额外导入到 CPA（CLIProxyAPI）
-        cpa_cfg = (card_cfg or {}).get("cpa") or {}
+        cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
         if pay_status == "succeeded" and cpa_cfg.get("enabled"):
             try:
                 sid = (pay_result.get("raw") or {}).get("session_id", "") if isinstance(pay_result.get("raw"), dict) else ""
@@ -950,12 +1014,71 @@ def _register_one(args_tuple):
 
 
 def batch(card_config_path, count, delay=30, workers=1, **kwargs):
-    """批量运行 pipeline（支持并行）"""
+    """批量运行 N 次。可选 modifier:
+       - register_only=True: 每次只 register（不付费），workers 串行
+       - pay_only=True:      每次只 pay_only（复用未付账号），workers 串行
+       - 都不开:              每次走完整 pipeline（注册+付费）
+    """
     use_paypal = kwargs.get("use_paypal", False)
+    is_register_only = bool(kwargs.pop("register_only", False))
+    is_pay_only = bool(kwargs.pop("pay_only", False))
+    use_gopay = bool(kwargs.pop("use_gopay", False))
+    gopay_otp_file = kwargs.pop("gopay_otp_file", "")
 
     # 构造共享 pool + team_client（所有 worker 复用）
     card_cfg = _read_card_cfg(card_config_path)
     cardw_path = _load_cardw_path_from_card_cfg(card_cfg, kwargs.get("cardw_config_path"))
+
+    # ── register-only batch：每次 register，串行（避免并行同 IP 触发风控）
+    if is_register_only:
+        if not cardw_path:
+            print("[batch:register-only] 缺 cardw_config_path", file=sys.stderr)
+            sys.exit(2)
+        print(f"\n[batch] === register-only × {count} 串行 ===")
+        results = []
+        ok_count = 0
+        for i in range(count):
+            print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (register-only)\n{'#'*60}")
+            try:
+                r = register(cardw_path)
+                r["batch_index"] = i
+                if r.get("status") == "ok":
+                    ok_count += 1
+            except Exception as e:
+                r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
+                print(f"[batch] ✗ 注册异常: {e}")
+            results.append(r)
+            print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
+            if i < count - 1 and delay > 0:
+                time.sleep(delay)
+        print(f"\n[batch] register-only 完成: {ok_count}/{count} 成功")
+        return results
+
+    # ── pay-only batch：每次 pay_only（复用未付账号），串行
+    if is_pay_only:
+        print(f"\n[batch] === pay-only × {count} 串行 ===")
+        results = []
+        ok_count = 0
+        for i in range(count):
+            print(f"\n{'#'*60}\n# 批次 {i+1}/{count}  (pay-only)\n{'#'*60}")
+            try:
+                r = pay_only(
+                    card_config_path,
+                    use_paypal=use_paypal, use_gopay=use_gopay,
+                    gopay_otp_file=gopay_otp_file,
+                )
+                r["batch_index"] = i
+                if r.get("status") == "succeeded":
+                    ok_count += 1
+            except Exception as e:
+                r = {"batch_index": i, "status": "error", "error": str(e)[:200]}
+                print(f"[batch] ✗ 支付异常: {e}")
+            results.append(r)
+            print(f"[batch] 进度 {i+1}/{count}  累计 ok={ok_count}")
+            if i < count - 1 and delay > 0:
+                time.sleep(delay)
+        print(f"\n[batch] pay-only 完成: {ok_count}/{count} 成功")
+        return results
     ts_cfg = card_cfg.get("team_system") or {}
     cd_h = int(ts_cfg.get("domain_cooldown_hours", 24))
     pool = _build_domain_pool_from_cardw(cardw_path, cd_h)
@@ -1102,37 +1225,179 @@ def batch(card_config_path, count, delay=30, workers=1, **kwargs):
 
 def _append_result(record):
     try:
-        with open(RESULTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        get_db().add_pipeline_result(record)
     except Exception:
         pass
+
+
+def _norm_email(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _paid_or_consumed_emails() -> set[str]:
+    """Emails that should not be retried by --pay-only.
+
+    Normal full pipeline writes registration/payment state to SQLite, while
+    `card.py` writes terminal payment records to the same DB.  Some
+    payment errors happen before card.py can recover the email, so we consult
+    both streams.  `User is already paid` is treated as consumed even when the
+    state is recorded as error: retrying the same account would only loop.
+    """
+    consumed: set[str] = set()
+
+    for d in get_db().iter_pipeline_results():
+        pay_block = d.get("payment") if isinstance(d.get("payment"), dict) else {}
+        reg_block = d.get("registration") if isinstance(d.get("registration"), dict) else {}
+        status = str(pay_block.get("status") or d.get("status") or "").lower()
+        email = _norm_email(
+            pay_block.get("email")
+            or reg_block.get("email")
+            or d.get("chatgpt_email")
+            or d.get("email")
+        )
+        err = str(pay_block.get("error") or d.get("error") or "")
+        if email and (status == "succeeded" or "user is already paid" in err.lower()):
+            consumed.add(email)
+
+    for d in get_db().iter_card_results():
+        status = str(d.get("status") or "").lower()
+        email = _norm_email(d.get("chatgpt_email") or d.get("email"))
+        err = str(d.get("error") or "")
+        if email and (status == "succeeded" or "user is already paid" in err.lower()):
+            consumed.add(email)
+
+    return consumed
+
+
+def _select_recent_registered_account_for_pay_only() -> dict | None:
+    """Pick the newest registered account that has not already succeeded.
+
+    This makes `--pay-only` useful for the common case where registration
+    completed but payment was blocked by captcha/OTP/DataDome/etc.  The selected
+    account is returned with its original session/access/device credentials.
+    """
+    accounts = _load_registered_accounts()
+    if not accounts:
+        return None
+
+    consumed = _paid_or_consumed_emails()
+    seen: set[str] = set()
+    for acc in reversed(accounts):
+        if not isinstance(acc, dict):
+            continue
+        email = _norm_email(acc.get("email"))
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        if email in consumed:
+            continue
+        if not (acc.get("session_token") or acc.get("access_token")):
+            continue
+        selected = dict(acc)
+        selected["email"] = email
+        return selected
+    return None
+
+
+def pay_only(card_config_path, *, use_paypal=False, use_gopay=False,
+             gopay_otp_file=None, timeout_pay=600, prefer_recent=True):
+    """Retry payment only.
+
+    Default behavior is now:
+      1. use the newest account in SQLite storage that has not
+         already succeeded/been consumed;
+      2. fall back to credentials embedded in the payment config if no reusable
+         account exists.
+
+    This preserves the old config-token path while preventing freshly
+    registered-but-unpaid accounts from being wasted.
+    """
+    account = _select_recent_registered_account_for_pay_only() if prefer_recent else None
+    email = _norm_email(account.get("email")) if account else ""
+    try:
+        card_cfg = _read_card_cfg(card_config_path)
+    except Exception:
+        card_cfg = {}
+    if account:
+        print(
+            "[pay-only] 复用最近未支付注册账号: "
+            f"{email} "
+            f"session_token={'yes' if account.get('session_token') else 'no'} "
+            f"access_token={'yes' if account.get('access_token') else 'no'} "
+            f"device_id={'yes' if account.get('device_id') else 'no'}"
+        )
+    else:
+        print("[pay-only] 未找到可复用注册账号，回退使用 config 里的 session_token/access_token")
+
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": "pay_only",
+        "registration": {"status": "reused" if account else "config", "email": email},
+        "payment": {},
+        "domain": email.split("@", 1)[1] if "@" in email else "",
+        "proxy": "",
+    }
+    try:
+        result = pay(
+            card_config_path,
+            session_token=account.get("session_token") if account else None,
+            access_token=account.get("access_token") if account else None,
+            device_id=account.get("device_id", "") if account else None,
+            use_paypal=use_paypal,
+            use_gopay=use_gopay,
+            gopay_otp_file=gopay_otp_file,
+            timeout=timeout_pay,
+        )
+        status = result.get("status", "unknown")
+        raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+        pay_email = _norm_email(email or raw.get("chatgpt_email") or raw.get("email"))
+        record["payment"] = {"status": status, "email": pay_email}
+        cpa_cfg = _cpa_cfg_for_card_payment(card_cfg or {})
+        if status == "succeeded" and cpa_cfg.get("enabled"):
+            try:
+                sid = raw.get("session_id", "") if isinstance(raw, dict) else ""
+                cpa_status = _cpa_import_after_team(pay_email, sid, cpa_cfg)
+                record["cpa_import"] = cpa_status
+            except Exception as e:
+                print(f"[CPA] 导入异常: {e}")
+                record["cpa_import"] = "error"
+        _append_result(record)
+        return result
+    except PaymentError as e:
+        record["payment"] = {"status": "error", "email": email, "error": str(e)[:200]}
+        _append_result(record)
+        raise
 
 
 # ──────────────────────────────────────────────
 # free_only mode helpers (OAuth 状态管理 + 失败分类)
 # ──────────────────────────────────────────────
 
-ACCOUNT_OAUTH_STATUS_FILE = OUTPUT_DIR / "account_oauth_status.json"
 _OAUTH_TRANSIENT_COOLDOWN_S = 6 * 3600  # transient_failed 6h cooldown
 
 
 def _load_oauth_status_map() -> dict:
-    if not ACCOUNT_OAUTH_STATUS_FILE.exists():
-        return {}
     try:
-        with open(ACCOUNT_OAUTH_STATUS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return get_db().load_oauth_status_map()
     except Exception:
         return {}
 
 
 def _save_oauth_status_map(m: dict) -> None:
+    """Persist an oauth status map to SQLite.
+
+    Kept for internal callers that operate on the whole map; runtime state is
+    not exported to JSON.
+    """
     try:
-        ACCOUNT_OAUTH_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = ACCOUNT_OAUTH_STATUS_FILE.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False, indent=2)
-        tmp.replace(ACCOUNT_OAUTH_STATUS_FILE)
+        for email, row in (m or {}).items():
+            if isinstance(row, dict):
+                get_db().set_oauth_status(
+                    email,
+                    str(row.get("status") or ""),
+                    str(row.get("fail_reason") or ""),
+                    str(row.get("ts") or ""),
+                )
     except Exception as e:
         print(f"[free] 保存 oauth status 失败: {e}")
 
@@ -1141,19 +1406,20 @@ def _set_account_oauth_status(email: str, status: str, fail_reason: str = "") ->
     """status: pending / succeeded / dead / transient_failed"""
     if not email:
         return
-    m = _load_oauth_status_map()
-    m[email.lower()] = {
-        "status": status,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "fail_reason": fail_reason,
-    }
-    _save_oauth_status_map(m)
+    ts = datetime.now(timezone.utc).isoformat()
+    try:
+        get_db().set_oauth_status(email, status, fail_reason, ts)
+    except Exception:
+        pass
 
 
 def _get_account_oauth_status(email: str):
     if not email:
         return None
-    return _load_oauth_status_map().get(email.lower())
+    try:
+        return _load_oauth_status_map().get(email.lower())
+    except Exception:
+        return None
 
 
 def _should_skip_oauth_account(email: str) -> bool:
@@ -1174,22 +1440,15 @@ def _should_skip_oauth_account(email: str) -> bool:
 
 
 def _load_registered_accounts() -> list:
-    if not REGISTERED_ACCOUNTS_FILE.exists():
-        return []
-    accounts = []
     try:
-        with open(REGISTERED_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    accounts.append(json.loads(line))
-                except Exception:
-                    continue
+        return get_db().iter_registered_accounts()
     except Exception:
-        pass
-    return accounts
+        return []
+
+
+def _find_latest_registered_account_for_email(email: str) -> dict:
+    """Return the newest registered-account row for `email`, if any."""
+    return get_db().find_latest_registered_account(email)
 
 
 def _password_from_email(email: str) -> str:
@@ -1303,24 +1562,18 @@ def _load_cardw_path_from_card_cfg(card_cfg, fallback_cardw=None):
 
 
 def _load_secrets():
-    """从 output/secrets.json 读取凭证（gitignored 不入库）。"""
-    sp = OUTPUT_DIR / "secrets.json"
-    if not sp.exists():
-        return {}
+    """从 SQLite 运行时库读取 Cloudflare/KV 等敏感凭证。"""
     try:
-        with open(sp, "r", encoding="utf-8") as f:
-            return json.load(f)
+        data = get_db().get_runtime_json(SECRETS_KEY, {})
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        print(f"[secrets] 读 {sp} 失败: {e}")
+        print(f"[secrets] 读数据库失败: {e}")
         return {}
 
 
 # ──────────────────────────────────────────────
 # Daemon：持续维护 gpt-team 系统可用账号数
 # ──────────────────────────────────────────────
-
-DAEMON_STATE_FILE = OUTPUT_DIR / "daemon_state.json"
-
 
 def _cleanup_temp_leftovers(max_age_s: int = 1800, verbose: bool = False) -> dict:
     """清理孤儿临时文件以防 /tmp（tmpfs）被 SIGKILL 残留吃爆。
@@ -1505,7 +1758,7 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
     - 可用定义：isOpen & !isBanned & !isDisabled & !noInvitePermission & seat 未满
     - 限流：每小时 / 每日上限（避免短时间批量触发风控）
     - 保护：连续失败 ≥ max_consecutive_failures 时冷却 consecutive_fail_cooldown_s
-    - 状态持久化：output/daemon_state.json
+    - 状态持久化：SQLite runtime_meta[daemon_state]
     - 优雅退出：SIGINT/SIGTERM 完成当前循环后停止
     """
     import signal
@@ -1578,9 +1831,9 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
         "total_zone_rotations": 0,
         "zone_reg_fail_streak": 0,
     }
-    if DAEMON_STATE_FILE.exists():
-        try:
-            with open(DAEMON_STATE_FILE) as f: old = json.load(f)
+    try:
+        old = get_db().get_runtime_json(DAEMON_STATE_KEY, {})
+        if isinstance(old, dict):
             for k in ("total_attempts", "total_succeeded", "total_failed",
                       "consecutive_failures", "rate_hour_ts", "rate_day_ts",
                       "last_error", "last_stats",
@@ -1589,8 +1842,8 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
                       "current_zone", "zone_ip_rotations", "total_zone_rotations",
                       "zone_reg_fail_streak"):
                 if k in old: state[k] = old[k]
-        except Exception as e:
-            print(f"[daemon] 读历史 state 失败: {e}")
+    except Exception as e:
+        print(f"[daemon] 读历史 state 失败: {e}")
 
     # 初始化 current_zone（若 provisioner 是多 zone）
     zone_list = []
@@ -1611,8 +1864,7 @@ def daemon(card_config_path, cardw_config_path=None, use_paypal=False):
 
     def _save():
         try:
-            with open(DAEMON_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
+            get_db().set_runtime_json(DAEMON_STATE_KEY, state)
         except Exception as e:
             print(f"[daemon] 存 state 失败: {e}")
 
@@ -1940,7 +2192,7 @@ def _build_domain_pool_from_cardw(cardw_path, cooldown_hours=24):
             print(f"[CF] auto_provision 已启用但缺 token 或 zone（api_token={bool(token)}, zones={zones}）")
 
     min_avail = int(ap_cfg.get("min_available", 2))
-    return DomainPool(lst, DOMAIN_STATE_FILE, cooldown_hours,
+    return DomainPool(lst, DOMAIN_STATE_KEY, cooldown_hours,
                        provisioner=provisioner, min_available=min_avail)
 
 
@@ -2274,61 +2526,17 @@ def _rewrite_card_with_proxy(src_path, proxy_url):
 
 
 def _find_latest_refresh_token_for_email(email, session_id=""):
-    """从 CTF-pay/results.jsonl 倒序找匹配 email(+session_id) 的 refresh_token"""
-    if not CARD_RESULTS_FILE.exists():
-        return ""
     try:
-        with open(CARD_RESULTS_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            if d.get("chatgpt_email") != email:
-                continue
-            if session_id and d.get("session_id") != session_id:
-                continue
-            return d.get("refresh_token", "") or ""
+        return get_db().latest_refresh_token_for_email(email, session_id)
     except Exception as e:
         print(f"[results] 读 refresh_token 失败: {e}")
     return ""
 
 
 def _augment_card_result_last_match(email, session_id, extra_fields):
-    """CTF-pay/results.jsonl 倒序找到首条匹配 email(+session_id) 的记录，
-    合并 extra_fields 后整行写回（rewrite 全文件保证幂等）。"""
-    if not CARD_RESULTS_FILE.exists():
-        return False
+    """倒序找到首条匹配 email(+session_id) 的支付记录并补字段。"""
     try:
-        with open(CARD_RESULTS_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        updated = False
-        for i in range(len(lines) - 1, -1, -1):
-            raw = lines[i].strip()
-            if not raw:
-                continue
-            try:
-                d = json.loads(raw)
-            except Exception:
-                continue
-            if d.get("chatgpt_email") != email:
-                continue
-            if session_id and d.get("session_id") != session_id:
-                continue
-            for k, v in (extra_fields or {}).items():
-                if v is not None:
-                    d[k] = v
-            lines[i] = json.dumps(d, ensure_ascii=False) + "\n"
-            updated = True
-            break
-        if updated:
-            with open(CARD_RESULTS_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-        return updated
+        return get_db().augment_card_result_last_match(email, session_id, extra_fields)
     except Exception as e:
         print(f"[results] 写回字段失败: {e}")
         return False
@@ -2448,20 +2656,9 @@ def _oai_accept_team_invite(member_at: str, team_id: str,
 
 
 def _find_team_id_from_results(email: str) -> str:
-    """倒序扫 results.jsonl，找 chatgpt_email=email 的 team_account_id。"""
-    if not CARD_RESULTS_FILE.exists():
-        return ""
+    """倒序扫支付记录，找 chatgpt_email=email 的 team_account_id。"""
     try:
-        with open(CARD_RESULTS_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for line in reversed(lines):
-            raw = line.strip()
-            if not raw:
-                continue
-            try: d = json.loads(raw)
-            except Exception: continue
-            if d.get("chatgpt_email") == email:
-                return d.get("team_account_id") or ""
+        return get_db().find_team_id_from_results(email)
     except Exception as e:
         print(f"[self-dealer] 读 team_id 失败: {e}")
     return ""
@@ -2479,7 +2676,7 @@ def _cpa_import_after_team(
 
     Args:
         refresh_token: 显式传入的 rt（free_only 路径用）；不传时从
-            output/results.jsonl 按 email/sid 查（pay 流程默认行为）。
+            SQLite 支付记录按 email/sid 查（pay 流程默认行为）。
         is_free: True → CPA 推送 plan_tag 改用 cpa_cfg.free_plan_tag
             （免费账号档位）；False → 用 plan_tag（team / 付费档位）。
 
@@ -2494,12 +2691,87 @@ def _cpa_import_after_team(
         return "skipped"
 
     rt = (refresh_token or "").strip() or _find_latest_refresh_token_for_email(email, sid)
+    reg_acc = _find_latest_registered_account_for_email(email)
     if not rt:
-        print(f"[CPA] {email} 无 refresh_token，跳过")
-        return "no_rt"
+        # 真实支付后，refresh_token 可能因为 add-phone / rate-limit / 401 等原因
+        # 无法及时拿到；此时至少保留已注册账号里的 access_token 做“裸导入”
+        #，让 CPA 端先落库，后续再补 RT。
+        at = (reg_acc.get("access_token") or "").strip()
+        id_tok = (reg_acc.get("id_token") or "").strip() or at
+        if not at:
+            print(f"[CPA] {email} 无 refresh_token 且无 access_token，跳过")
+            return "no_rt"
+        account_id = _oai_team_id_from_access_token(at)
+        expired_iso = ""
+        try:
+            p = at.split(".")[1]
+            p += "=" * (4 - len(p) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(p).decode())
+            if payload.get("exp"):
+                expired_iso = datetime.fromtimestamp(payload["exp"], tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = {
+            "id_token": id_tok,
+            "access_token": at,
+            "refresh_token": rt,
+            "account_id": account_id,
+            "email": email,
+            "last_refresh": now_iso,
+            "expired": expired_iso,
+            "type": "codex",
+        }
+        print(f"[CPA] {email} 无 refresh_token，回退使用现有 access_token 裸导入")
+        tag = hashlib.md5(email.encode()).hexdigest()[:8]
+        plan_tag = (cpa_cfg.get("plan_tag") or "team").strip() or "team"
+        if is_free:
+            plan_tag = (cpa_cfg.get("free_plan_tag") or "free").strip() or "free"
+        name = f"codex-{tag}-{email}-{plan_tag}.json"
+        try:
+            try:
+                import curl_cffi.requests as cr
+                sess = cr.Session(impersonate="chrome136")
+                sess.proxies = {}
+                sess.trust_env = False
+                r = sess.post(
+                    f"{base_url}/v0/management/auth-files",
+                    params={"name": name},
+                    json=body,
+                    headers={"Authorization": f"Bearer {admin_key}",
+                             "Content-Type": "application/json"},
+                    timeout=int(cpa_cfg.get("timeout_s", 20)),
+                )
+                if r.status_code >= 400:
+                    raise RuntimeError(f"http={r.status_code} body={r.text[:200]}")
+                print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
+                return "ok"
+            except ImportError:
+                pass
+            req = urllib.request.Request(
+                f"{base_url}/v0/management/auth-files?name={urllib.parse.quote(name)}",
+                data=json.dumps(body).encode(),
+                headers={"Authorization": f"Bearer {admin_key}",
+                         "Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
+                method="POST",
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
+            with opener.open(req, timeout=int(cpa_cfg.get("timeout_s", 20))) as r:
+                resp = r.read().decode()
+            print(f"[CPA] ✓ {email} 已导入 → {base_url}  account_id={account_id[:8] or '?'}")
+            return "ok"
+        except urllib.error.HTTPError as e:
+            try: eb = e.read().decode()[:200]
+            except Exception: eb = ""
+            print(f"[CPA] ✗ {email} 上传失败 http={e.code} {eb}")
+            return "fail_upload"
+        except Exception as e:
+            print(f"[CPA] ✗ {email} 上传异常: {e}")
+            return "fail_upload"
 
     # 刷一次 refresh_token → 拿绑了 team 的 access_token + id_token
-    client_id = cpa_cfg.get("oauth_client_id", "YOUR_OPENAI_CODEX_CLIENT_ID")
+    client_id = cpa_cfg.get("oauth_client_id") or "app_EMoamEEZ73f0CkXaXp7hrann"
     at, id_tok, account_id = "", "", ""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 不走本地 proxy
     try:
@@ -2628,7 +2900,7 @@ def _team_probe_after_payment(pay_record, team_client, pool, domain):
         print(f"[Team] ❌ {email} 导入失败: {probe.get('error')}")
     else:
         print(f"[Team] ❓ {email} status={st}  err={probe.get('error','')[:200]}")
-    # 更新 CTF-pay/results.jsonl
+    # 更新支付结果记录
     _augment_card_result_last_match(email, sid, {
         "invite_permission": st,
         "team_gpt_account_pk": probe.get("account_id"),
@@ -2684,7 +2956,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
     team_id = _find_team_id_from_results(owner_email)
     owner_rt = _find_latest_refresh_token_for_email(owner_email)
     if not (team_id and owner_rt):
-        raise RuntimeError(f"[self-dealer] 从 results.jsonl 读 owner 数据失败 team_id={bool(team_id)} rt={bool(owner_rt)}")
+        raise RuntimeError(f"[self-dealer] 从支付数据库读 owner 数据失败 team_id={bool(team_id)} rt={bool(owner_rt)}")
     print(f"\n[self-dealer] ✓ Owner 就绪：{owner_email}  team_id={team_id}  rt_len={len(owner_rt)}")
 
     tok = _oai_exchange_refresh_to_access_token(owner_rt)
@@ -2807,7 +3079,7 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                 entry["status"] = "no_rt"
                 continue
 
-            # 按 results.jsonl 惯例追加一条，让 _cpa_import_after_team 能读到
+            # 追加一条支付成功记录，让 _cpa_import_after_team 能读到
             sid = f"self-dealer-m{i}-{mem_email.split('@')[0][:20]}"
             res_entry = {
                 "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -2819,10 +3091,9 @@ def self_dealer(card_config_path, cardw_config_path=None, use_paypal=False,
                 "team_account_id": team_id,
             }
             try:
-                with open(CARD_RESULTS_FILE, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(res_entry, ensure_ascii=False) + "\n")
+                get_db().add_card_result(res_entry)
             except Exception as e:
-                print(f"[self-dealer] 写 results.jsonl 失败: {e}")
+                print(f"[self-dealer] 写支付记录失败: {e}")
 
             # CPA 推送
             try:
@@ -2953,7 +3224,7 @@ def free_register_loop(card_config_path, cardw_config_path=None, count: int = 0)
 
 
 def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
-    """free_only mode：读 registered_accounts.jsonl 给老号补 rt + 推 CPA(free)。
+    """free_only mode：读数据库里的注册账号给老号补 rt + 推 CPA(free)。
 
     跳过：已有 refresh_token / oauth_status==succeeded / oauth_status==dead /
     transient_failed 在 6h cooldown 内的账号。
@@ -2975,7 +3246,7 @@ def free_backfill_rt_loop(card_config_path, cardw_config_path=None):
 
     accounts = _load_registered_accounts()
     if not accounts:
-        print("[free-backfill] registered_accounts.jsonl 为空，无可处理账号")
+        print("[free-backfill] 数据库注册账号为空，无可处理账号")
         return
 
     todo = []
@@ -3071,7 +3342,7 @@ def main():
     parser.add_argument("--register-only", action="store_true",
                         help="仅注册，不支付")
     parser.add_argument("--pay-only", action="store_true",
-                        help="仅支付（使用配置文件中的 session_token）")
+                        help="仅支付（优先复用最近注册但未支付账号；没有则使用配置文件中的 session_token）")
     parser.add_argument("--batch", type=int, default=0,
                         help="批量运行 N 次")
     parser.add_argument("--delay", type=float, default=30,
@@ -3083,11 +3354,11 @@ def main():
     parser.add_argument("--self-dealer", type=int, default=0, metavar="N",
                         help="自产自销：1 个 owner 付费开 Team + N 个 member 邀请上车 + 全部推 CPA")
     parser.add_argument("--self-dealer-resume", default="", metavar="OWNER_EMAIL",
-                        help="自产自销 resume 模式：跳过 Step 1，用已注册付费过的 owner（从 results.jsonl 读 team_id + rt）")
+                        help="自产自销 resume 模式：跳过 Step 1，用已注册付费过的 owner（从支付数据库读 team_id + rt）")
     parser.add_argument("--free-register", action="store_true",
                         help="free_only 模式：循环注册免费 ChatGPT 号 + OAuth 拿 rt + 推 CPA(free)")
     parser.add_argument("--free-backfill-rt", action="store_true",
-                        help="free_only 模式：读 registered_accounts.jsonl 给老号补 rt + 推 CPA(free)，跳过已 succeeded/dead")
+                        help="free_only 模式：读数据库老号记录补 rt + 推 CPA(free)，跳过已 succeeded/dead")
     parser.add_argument("--count", type=int, default=0, metavar="N",
                         help="--free-register 模式下注册 N 次后退出（0 = 无限）")
     args = parser.parse_args()
@@ -3116,7 +3387,18 @@ def main():
                         resume_owner_email=args.self_dealer_resume)
             return
 
-        if args.register_only:
+        # batch 是循环外壳，跟 register-only / pay-only 正交组合
+        if args.batch > 0:
+            batch(args.config, args.batch, delay=args.delay, workers=args.workers,
+                  use_paypal=args.paypal, cardw_config_path=args.cardw_config,
+                  register_only=args.register_only, pay_only=args.pay_only,
+                  use_gopay=args.gopay, gopay_otp_file=args.gopay_otp_file)
+
+        elif "--batch" in sys.argv:
+            print(f"[ERROR] --batch 参数必须 ≥ 1（当前 {args.batch}）", file=sys.stderr)
+            sys.exit(2)
+
+        elif args.register_only:
             cardw_cfg = args.cardw_config
             if not cardw_cfg:
                 with open(args.config) as f:
@@ -3127,13 +3409,13 @@ def main():
             print(json.dumps(result, ensure_ascii=False, indent=2))
 
         elif args.pay_only:
-            result = pay(args.config, use_paypal=args.paypal, use_gopay=args.gopay,
-                         gopay_otp_file=args.gopay_otp_file)
+            result = pay_only(
+                args.config,
+                use_paypal=args.paypal,
+                use_gopay=args.gopay,
+                gopay_otp_file=args.gopay_otp_file,
+            )
             print(f"\n结果: {result.get('status', '?')}")
-
-        elif args.batch > 0:
-            batch(args.config, args.batch, delay=args.delay, workers=args.workers,
-                  use_paypal=args.paypal, cardw_config_path=args.cardw_config)
 
         else:
             pipeline(args.config, cardw_config_path=args.cardw_config,

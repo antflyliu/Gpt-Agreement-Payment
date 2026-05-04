@@ -14,9 +14,10 @@ from .backend.routes import wizard as wizard_routes
 from .backend.routes import preflight as preflight_routes
 from .backend.routes import sniff as sniff_routes
 from .backend.routes import config as config_routes
+from .backend.routes import inventory as inventory_routes
 from .backend.routes import run as run_routes
-# from .backend.routes import whatsapp as whatsapp_routes
 from .backend.routes import cloudflare_kv as cf_kv_routes
+from .backend.routes import whatsapp as whatsapp_routes
 
 logger = logging.getLogger("webui")
 
@@ -81,17 +82,23 @@ def create_app() -> FastAPI:
             },
         )
 
-    app.include_router(setup_routes.router, prefix="/webui")
-    app.include_router(auth_routes.router, prefix="/webui")
-    app.include_router(wizard_routes.router, prefix="/webui")
-    app.include_router(preflight_routes.router, prefix="/webui")
-    app.include_router(sniff_routes.router, prefix="/webui")
-    app.include_router(config_routes.router, prefix="/webui")
-    app.include_router(run_routes.router, prefix="/webui")
-    # app.include_router(whatsapp_routes.router, prefix="/webui")
-    app.include_router(cf_kv_routes.router, prefix="/webui")
+    routers = (
+        setup_routes.router,
+        auth_routes.router,
+        wizard_routes.router,
+        preflight_routes.router,
+        sniff_routes.router,
+        config_routes.router,
+        inventory_routes.router,
+        run_routes.router,
+        cf_kv_routes.router,
+        whatsapp_routes.router,
+    )
+    for prefix in ("", "/webui"):
+        for router in routers:
+            app.include_router(router, prefix=prefix)
 
-
+    @app.get("/webui/api/healthz")
     @app.get("/api/healthz")
     def healthz():
         return {"status": "ok"}
@@ -99,11 +106,12 @@ def create_app() -> FastAPI:
     if FRONTEND_DIST.exists():
         assets_dir = FRONTEND_DIST / "assets"
         if assets_dir.exists():
-            app.mount("/webui/assets", StaticFiles(directory=assets_dir), name="webui-assets")
+            # Mount under both / and /webui/ so the same build serves direct
+            # (127.0.0.1:8765/) and reverse-proxied (.../webui/) deployments.
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+            app.mount("/webui/assets", StaticFiles(directory=assets_dir), name="assets_webui")
 
-        @app.get("/{full_path:path}")
-        def spa(full_path: str):
+        def _serve(full_path: str):
             if full_path.startswith("api/"):
                 return FileResponse(FRONTEND_DIST / "index.html", status_code=404)
             cleaned = full_path.removeprefix("webui/") if full_path.startswith("webui/") else full_path
@@ -115,6 +123,14 @@ def create_app() -> FastAPI:
             if f.is_file():
                 return FileResponse(f)
             return FileResponse(FRONTEND_DIST / "index.html")
+
+        @app.get("/webui/{full_path:path}")
+        def spa_webui(full_path: str):
+            return _serve(full_path)
+
+        @app.get("/{full_path:path}")
+        def spa(full_path: str):
+            return _serve(full_path)
 
     return app
 

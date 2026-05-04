@@ -38,6 +38,16 @@ export default {
     const addrDigits = ((to + ' ' + from).match(/\d/g) || []).join('');
     const isFromAddr = (s) => addrDigits.length >= 6 && addrDigits.includes(s);
 
+    // OpenAI 邮件 HTML 里大量出现 #353740 / #10A37F 等品牌色 hex，fallback
+    // \b\d{6}\b 会把全数字 hex（如 #353740）误抽成 OTP。
+    // 用 negative lookbehind 排除前面是 # 的，并显式排除常见 CSS hex 上下文。
+    const isHexColor = (haystack, idx) => {
+      if (idx > 0 && haystack[idx - 1] === '#') return true;
+      // "color:353740" / "background-color: #353740" / "bgcolor=\"353740\""
+      const before = haystack.slice(Math.max(0, idx - 30), idx);
+      return /(?:color|background|bgcolor|fill|stroke)\s*[:=]\s*["']?#?\s*$/i.test(before);
+    };
+
     // OTP extraction — semantic context first to avoid grabbing tracking ids,
     // and skip any candidate that's a substring of the address digits.
     let otp = null;
@@ -52,7 +62,9 @@ export default {
     for (const re of candidates) {
       let m;
       while ((m = re.exec(haystack)) !== null) {
-        if (!isFromAddr(m[1])) { otp = m[1]; break; }
+        if (!isFromAddr(m[1]) && !isHexColor(haystack, m.index + m[0].lastIndexOf(m[1]))) {
+          otp = m[1]; break;
+        }
       }
       if (otp) break;
     }
@@ -61,9 +73,13 @@ export default {
       // To:/From:/Delivered-To: 里的数字不参与 fallback 匹配
       const bodyStart = raw.search(/\r?\n\r?\n/);
       const body = bodyStart >= 0 ? raw.slice(bodyStart) : raw;
-      const all = body.match(/\b\d{6}\b/g) || [];
-      for (const cand of all) {
-        if (!isFromAddr(cand)) { otp = cand; break; }
+      const re = /\b(\d{6})\b/g;
+      let m;
+      while ((m = re.exec(body)) !== null) {
+        const cand = m[1];
+        if (isFromAddr(cand)) continue;
+        if (isHexColor(body, m.index)) continue;
+        otp = cand; break;
       }
     }
 

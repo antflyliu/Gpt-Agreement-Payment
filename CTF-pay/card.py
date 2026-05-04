@@ -36,6 +36,10 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+_REPO_DIR_BOOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_DIR_BOOT not in sys.path:
+    sys.path.insert(0, _REPO_DIR_BOOT)
+from webui.backend.db import get_db
 try:
     from curl_cffi.requests import Session as CurlCffiSession
     _HAS_CURL_CFFI = True
@@ -54,6 +58,14 @@ from shared.camoufox_runtime import resolve_camoufox_geoip
 _OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "output")
 os.makedirs(os.path.join(_OUTPUT_DIR, "logs"), exist_ok=True)
 LOG_FILE = os.path.join(_OUTPUT_DIR, "logs", "card.log")
+
+# 让 `from cf_kv_otp_provider import ...` 在 card.py 直接执行/被 pipeline 子进程
+# 拉起时都能命中 `CTF-reg/` 下的实现。否则 RT / PayPal OTP 会在
+# `python CTF-pay/card.py ...` 的默认 sys.path 里找不到该模块。
+_REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CTF_REG_DIR = os.path.join(_REPO_DIR, "CTF-reg")
+if os.path.isdir(_CTF_REG_DIR) and _CTF_REG_DIR not in sys.path:
+    sys.path.insert(0, _CTF_REG_DIR)
 
 def _init_log():
     """清空并初始化 log.txt"""
@@ -1693,6 +1705,59 @@ def _extract_checkout_identifiers(data: dict) -> tuple[str, str, str]:
     return cs_id, processor_entity, checkout_url
 
 
+def _select_fresh_checkout_url(
+    *,
+    provider_url: str,
+    canonical_url: str,
+    fresh_cfg: dict,
+    checkout_payload: dict,
+) -> str:
+    """Choose which checkout URL should be exposed to callers.
+
+    ChatGPT's checkout API may return a provider/hosted URL (for example the
+    long hosted checkout URL) while the automation can also reconstruct the
+    canonical in-app URL:
+
+        https://chatgpt.com/checkout/{processor_entity}/{cs_live...}
+
+    Historically we always rewrote the API response to the canonical URL. That
+    is correct for embedded/custom checkout replay, but it hides the real
+    hosted/long link when the request was created with hosted checkout mode.
+
+    Selection is config driven:
+      - fresh_checkout.output_url_mode or fresh_checkout.plan.output_url_mode
+        can be provider/raw/long/hosted or canonical/chatgpt/short.
+      - If omitted, checkout_ui_mode=hosted defaults to provider; everything
+        else defaults to canonical.
+    """
+
+    provider_url = (provider_url or "").strip()
+    canonical_url = (canonical_url or "").strip()
+    plan_cfg = fresh_cfg.get("plan") or {}
+    explicit_mode = str(
+        plan_cfg.get("output_url_mode")
+        or fresh_cfg.get("output_url_mode")
+        or ""
+    ).strip().lower()
+    checkout_ui_mode = str(
+        plan_cfg.get("checkout_ui_mode")
+        or checkout_payload.get("checkout_ui_mode")
+        or ""
+    ).strip().lower()
+
+    provider_modes = {"provider", "raw", "long", "hosted", "pay_openai", "pay.openai.com"}
+    canonical_modes = {"canonical", "chatgpt", "short", "custom", "embedded"}
+
+    if explicit_mode in provider_modes:
+        return provider_url or canonical_url
+    if explicit_mode in canonical_modes:
+        return canonical_url or provider_url
+
+    if checkout_ui_mode in {"hosted", "hosted_checkout", "redirect"}:
+        return provider_url or canonical_url
+    return canonical_url or provider_url
+
+
 def _extract_checkout_totals(payload: dict | None) -> dict:
     payload = payload or {}
     total_summary = payload.get("total_summary") or {}
@@ -2449,14 +2514,18 @@ def generate_fresh_checkout(
                     f"https://chatgpt.com/checkout/{processor_entity}/{session_id}"
                     if processor_entity else ""
                 )
-                if canonical_chatgpt_url:
-                    fresh_url = canonical_chatgpt_url
-                elif not fresh_url and processor_entity:
-                    fresh_url = canonical_chatgpt_url
+                fresh_url = _select_fresh_checkout_url(
+                    provider_url=provider_url,
+                    canonical_url=canonical_chatgpt_url,
+                    fresh_cfg=fresh_cfg,
+                    checkout_payload=payload,
+                )
 
                 _log(f"      [fresh] session_id: {session_id}")
                 if provider_url and provider_url != fresh_url:
                     _log(f"      [fresh] provider_url: {provider_url}")
+                if canonical_chatgpt_url and canonical_chatgpt_url != fresh_url:
+                    _log(f"      [fresh] canonical_url: {canonical_chatgpt_url}")
                 if fresh_url:
                     _log(f"      [fresh] fresh_url: {fresh_url}")
 
@@ -2479,10 +2548,10 @@ def generate_fresh_checkout(
                             is_coupon_from_query_param=bool(
                                 promo_campaign.get("is_coupon_from_query_param")
                             ),
-                            referer_url=fresh_url or provider_url,
+                            referer_url=canonical_chatgpt_url or provider_url or fresh_url,
                         )
 
-                if fresh_cfg.get("warmup_route_data", True) and fresh_url and cookie_header:
+                if fresh_cfg.get("warmup_route_data", True) and canonical_chatgpt_url and cookie_header:
                     route_data_url = (
                         f"https://chatgpt.com/checkout/{processor_entity}/{session_id}.data"
                         "?_routes=routes%2Fcheckout.%24entity.%24checkoutId"
@@ -2503,6 +2572,8 @@ def generate_fresh_checkout(
                     "url": fresh_url,
                     "checkout_session_id": session_id,
                     "processor_entity": processor_entity,
+                    "provider_url": provider_url,
+                    "canonical_url": canonical_chatgpt_url,
                     "publishable_key": data.get("publishable_key", ""),
                     "client_secret": data.get("client_secret", ""),
                     "coupon_check": coupon_check,
@@ -4382,7 +4453,11 @@ def _drive_gopay_from_redirect(
     if otp_file:
         provider = _gopay.file_watch_otp_provider(_Path(otp_file), timeout=300.0)
     else:
-        provider = _gopay.cli_otp_provider
+        provider = _gopay.build_configured_otp_provider(
+            gopay_cfg,
+            fallback_provider=_gopay.cli_otp_provider,
+            log=_log,
+        )
 
     charger = _gopay.GoPayCharger(
         cs_session, gopay_cfg,
@@ -4996,8 +5071,42 @@ def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
         return ""
 
 
+_OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+
+
+def _resolve_codex_oauth_client_id(*values: str) -> str:
+    """Return the first non-placeholder Codex OAuth client id, or the
+    OpenAI Codex CLI's well-known constant as a final fallback. Treat
+    ``YOUR_*`` placeholders as absent — they would 400 at authorize."""
+    candidates = [os.getenv("OAUTH_CODEX_CLIENT_ID", ""), *values]
+    for value in candidates:
+        client_id = (value or "").strip()
+        if not client_id:
+            continue
+        if client_id.startswith("YOUR_") or client_id.endswith("_CLIENT_ID"):
+            continue
+        return client_id
+    return _OPENAI_CODEX_CLIENT_ID
+
+
+def _codex_oauth_client_id_from_config(cfg: dict) -> str:
+    """Resolve the Codex OAuth client_id from payment config/env."""
+    if not isinstance(cfg, dict):
+        cfg = {}
+    cpa_cfg = cfg.get("cpa") or {}
+    fresh_cfg = cfg.get("fresh_checkout") or {}
+    auth_cfg = fresh_cfg.get("auth") or {}
+    return _resolve_codex_oauth_client_id(
+        (cpa_cfg or {}).get("oauth_client_id", ""),
+        cfg.get("oauth_client_id", ""),
+        cfg.get("codex_oauth_client_id", ""),
+        auth_cfg.get("oauth_client_id", ""),
+    )
+
+
 def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: dict,
-                                          proxy_url: str = "") -> str:
+                                          proxy_url: str = "",
+                                          oauth_client_id: str = "") -> str:
     """
     支付成功后重新登录换 refresh_token。
     流程：
@@ -5021,7 +5130,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     def _b64url_nopad(raw: bytes) -> str:
         return _b64.urlsafe_b64encode(raw).decode().rstrip("=")
 
-    codex_client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or "YOUR_OPENAI_CODEX_CLIENT_ID"
+    codex_client_id = _resolve_codex_oauth_client_id(oauth_client_id)
     codex_redirect = "http://localhost:1455/auth/callback"
     codex_state = _b64url_nopad(_secrets.token_bytes(24))
     verifier = _b64url_nopad(_secrets.token_bytes(64))
@@ -5078,7 +5187,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                 url = route.request.url
                 if "localhost:1455" in url and "code=" in url:
                     code_captured["url"] = url
-                    _log(f"      [RT] 拦截 callback: {url[:150]}")
+                    _log("      [RT] 拦截 callback: code=<redacted>")
                 try:
                     route.fulfill(status=200, content_type="text/html", body="<html>OK</html>")
                 except Exception:
@@ -5165,7 +5274,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
                         if not otp_code:
                             _log("      [RT] OTP 获取超时")
                             return ""
-                        _log(f"      [RT] OTP: {otp_code}")
+                        _log(f"      [RT] OTP 已获取 (len={len(otp_code)})")
                         # 填入 OTP
                         filled = False
                         single = page.query_selector('input[autocomplete="one-time-code"]:visible') or \
@@ -7253,8 +7362,6 @@ def poll_result(session: requests.Session, pk: str, session_id: str, stripe_ver:
     raise TimeoutError("轮询超时 (60s)")
 
 
-RESULTS_FILE = os.path.join(_OUTPUT_DIR, "results.jsonl")
-
 
 def _record_result(
     status: str,
@@ -7266,7 +7373,7 @@ def _record_result(
     error_msg: str = "",
     extra: dict = None,
 ):
-    """追加一条结果到 results.jsonl（每行一个 JSON）"""
+    """把支付结果写入 SQLite 运行时数据库。"""
     record = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         "status": status,
@@ -7285,8 +7392,7 @@ def _record_result(
             if k in allowed and v:
                 record[k] = v
     try:
-        with open(RESULTS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        get_db().add_card_result(record)
     except Exception:
         pass
 
@@ -8346,6 +8452,17 @@ def run(
                         _log(f"      [manual_approval] ChatGPT approve: {ar.status_code} body={ar.text[:200]}")
                         if ar.status_code != 200:
                             raise RuntimeError(f"ChatGPT approve 失败: {ar.status_code} {ar.text[:200]}")
+                        try:
+                            approve_payload = ar.json() or {}
+                        except Exception:
+                            approve_payload = {}
+                        approve_result = str(approve_payload.get("result") or "").lower()
+                        if approve_result and approve_result != "approved":
+                            # result=blocked is the signal that this confirm path needs
+                            # an hCaptcha-backed retry. Surface the literal word so the
+                            # outer confirm retry handler falls into the existing solver
+                            # path instead of polling Stripe until timeout.
+                            raise RuntimeError(f"manual_approval approve blocked: result={approve_result}")
                     except Exception as e_ap:
                         _log(f"      [manual_approval] approve 异常: {e_ap}")
                         raise
@@ -8534,10 +8651,10 @@ def run(
 
     # 记录结果
     chatgpt_email = fresh_cfg.get("_chatgpt_email", card.get("email", ""))
-    payment_channel = "paypal" if use_paypal else "card"
+    payment_channel = "gopay" if use_gopay else ("paypal" if use_paypal else "card")
     result_state = result.get("state", "unknown")
 
-    # 从 registered_accounts.jsonl 查最近一条匹配 email 的 refresh_token
+    # 从数据库查最近一条匹配 email 的账号凭证。
     extra_info = {}
     # 支付成功时记录 Team workspace account_id
     try:
@@ -8554,28 +8671,13 @@ def run(
     # 支付成功才拿 refresh_token（失败不拿）
     if result_state == "succeeded" and chatgpt_email:
         try:
-            # 从 output/registered_accounts.jsonl 取本账号的 password
+            # 从 SQLite 主存储取本账号的 password。
             import os as _os
             _password = ""
-            accounts_file = _os.path.join(_OUTPUT_DIR, "registered_accounts.jsonl")
-            # 向后兼容：也回退到旧路径（项目根目录）
-            if not _os.path.exists(accounts_file):
-                legacy = _os.path.join(
-                    _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                    "registered_accounts.jsonl",
-                )
-                if _os.path.exists(legacy):
-                    accounts_file = legacy
-            if _os.path.exists(accounts_file):
-                with open(accounts_file, "r", encoding="utf-8") as af:
-                    for line in reversed(af.readlines()):
-                        try:
-                            entry = json.loads(line)
-                        except Exception:
-                            continue
-                        if entry.get("email") == chatgpt_email:
-                            _password = entry.get("password", "") or ""
-                            break
+            try:
+                _password = (get_db().find_latest_registered_account(chatgpt_email) or {}).get("password", "") or ""
+            except Exception:
+                _password = ""
 
             # 加载 CTF-reg/config.paypal-proxy.json 里的 mail 配置（供 IMAP 取 OTP）
             _mail_cfg = {}
@@ -8594,11 +8696,12 @@ def run(
             if _password and _mail_cfg:
                 _log("      [RT] 支付成功，重新登录拿 refresh_token ...")
                 rt_value = _exchange_refresh_token_with_session(
-                    email=chatgpt_email,
-                    password=_password,
-                    mail_cfg=_mail_cfg,
-                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
-                )
+	                    email=chatgpt_email,
+	                    password=_password,
+	                    mail_cfg=_mail_cfg,
+	                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
+	                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
+	                )
                 if rt_value:
                     extra_info["refresh_token"] = rt_value
                     _log(f"      [RT] ✅ 获得 refresh_token 长度={len(rt_value)}")
