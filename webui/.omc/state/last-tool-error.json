@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"cd D:/WORKSPACE/ai-space/Gpt-Agreement-Payment/webui && .venv/Scripts/pip.exe install -r requirements.txt\",\"timeout\":300000,\"description\":\"Install Python dependencies in venv\"}",
+  "error": "Exit code 1\nLooking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple\r\nWARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', TimeoutError('_ssl.c:983: The handshake operation timed out'))': /simple/fastapi/\r\nWARNING: Retrying (Retry(total=3, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProxyError('Cannot connect to proxy.', TimeoutError('_ssl.c:983: The han...",
+  "timestamp": "2026-05-02T23:28:49.442Z",
+  "retry_count": 1
+}

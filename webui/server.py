@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -41,6 +42,14 @@ def create_app() -> FastAPI:
     _setup_logging()
     app = FastAPI(title="Gpt-Agreement-Payment webui")
 
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:8765", "http://localhost:8765"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.exception_handler(PreflightError)
     async def _preflight_error_handler(request, exc: PreflightError):
         logger.warning("PreflightError %s: %s", exc.code, exc.msg)
@@ -72,15 +81,16 @@ def create_app() -> FastAPI:
             },
         )
 
-    app.include_router(setup_routes.router)
-    app.include_router(auth_routes.router)
-    app.include_router(wizard_routes.router)
-    app.include_router(preflight_routes.router)
-    app.include_router(sniff_routes.router)
-    app.include_router(config_routes.router)
-    app.include_router(run_routes.router)
-    # app.include_router(whatsapp_routes.router)
-    app.include_router(cf_kv_routes.router)
+    app.include_router(setup_routes.router, prefix="/webui")
+    app.include_router(auth_routes.router, prefix="/webui")
+    app.include_router(wizard_routes.router, prefix="/webui")
+    app.include_router(preflight_routes.router, prefix="/webui")
+    app.include_router(sniff_routes.router, prefix="/webui")
+    app.include_router(config_routes.router, prefix="/webui")
+    app.include_router(run_routes.router, prefix="/webui")
+    # app.include_router(whatsapp_routes.router, prefix="/webui")
+    app.include_router(cf_kv_routes.router, prefix="/webui")
+
 
     @app.get("/api/healthz")
     def healthz():
@@ -89,18 +99,18 @@ def create_app() -> FastAPI:
     if FRONTEND_DIST.exists():
         assets_dir = FRONTEND_DIST / "assets"
         if assets_dir.exists():
+            app.mount("/webui/assets", StaticFiles(directory=assets_dir), name="webui-assets")
             app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
         @app.get("/{full_path:path}")
         def spa(full_path: str):
             if full_path.startswith("api/"):
-                # Should not reach here — APIRouters claim /api/* — but guard just in case
                 return FileResponse(FRONTEND_DIST / "index.html", status_code=404)
-            f = FRONTEND_DIST / full_path
+            cleaned = full_path.removeprefix("webui/") if full_path.startswith("webui/") else full_path
+            f = FRONTEND_DIST / cleaned
             try:
                 f.resolve().relative_to(FRONTEND_DIST.resolve())
             except ValueError:
-                # Path escapes dist — serve index.html instead
                 return FileResponse(FRONTEND_DIST / "index.html")
             if f.is_file():
                 return FileResponse(f)
@@ -111,4 +121,4 @@ def create_app() -> FastAPI:
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(create_app(), host="0.0.0.0", port=8765)
+    uvicorn.run(create_app(), host="127.0.0.1", port=8765)
