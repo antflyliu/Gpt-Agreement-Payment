@@ -14,6 +14,7 @@
  *   WA_OTP_FILE     deprecated plain OTP output (optional legacy file-provider mirror)
  *   WA_SESSION_DIR  persistent WhatsApp session directory
  *   WA_HEADLESS     "1" (default) or "0"; wwebjs only
+ *   WA_PROXY_URL    optional HTTP(S) proxy for Baileys WebSocket; falls back to HTTPS_PROXY/HTTP_PROXY
  */
 const fs = require("fs");
 const path = require("path");
@@ -28,8 +29,10 @@ const stateFile = process.env.WA_STATE_FILE || "";
 const otpFile = process.env.WA_OTP_FILE || "";
 const sessionDir = process.env.WA_SESSION_DIR || path.join(process.cwd(), ".wa-session");
 const headless = (process.env.WA_HEADLESS || "1") !== "0";
+const proxyUrl = process.env.WA_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy || "";
 const dbMode = !!stateUrl;
 let memoryState = {};
+let lastStatePost = Promise.resolve();
 
 if (!dbMode && (!stateFile || !otpFile)) {
   console.error("WA_STATE_URL or WA_STATE_FILE+WA_OTP_FILE is required");
@@ -48,17 +51,22 @@ function atomicWrite(filePath, data) {
 }
 
 function postState(state) {
-  if (!dbMode) return;
-  fetch(stateUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-WA-Relay-Token": relayToken,
-    },
-    body: JSON.stringify(state),
-  }).catch((err) => {
-    console.error(`[state_post_error] ${err && err.message ? err.message : err}`);
-  });
+  if (!dbMode) return Promise.resolve();
+  const body = JSON.stringify(state);
+  lastStatePost = lastStatePost
+    .catch(() => {})
+    .then(() => fetch(stateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-WA-Relay-Token": relayToken,
+      },
+      body,
+    }))
+    .catch((err) => {
+      console.error(`[state_post_error] ${err && err.message ? err.message : err}`);
+    });
+  return lastStatePost;
 }
 
 function readState() {
@@ -83,6 +91,40 @@ function writeState(patch) {
     atomicWrite(stateFile, JSON.stringify(state, null, 2));
   }
   return state;
+}
+
+async function flushStatePost(timeoutMs = 2000) {
+  try {
+    await Promise.race([
+      lastStatePost,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+    ]);
+  } catch {
+    // postState already logs the underlying error; keep shutdown paths moving.
+  }
+}
+
+function redactProxyUrl(value) {
+  try {
+    const u = new URL(value);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return "[configured proxy]";
+  }
+}
+
+function makeProxyAgent() {
+  if (!proxyUrl) return null;
+  try {
+    const { HttpsProxyAgent } = require("https-proxy-agent");
+    const agent = new HttpsProxyAgent(proxyUrl);
+    console.log(`[wa] using proxy ${redactProxyUrl(proxyUrl)}`);
+    return agent;
+  } catch (e) {
+    const msg = `proxy agent unavailable for WA_PROXY_URL/HTTPS_PROXY: ${String(e && e.message || e)}`;
+    writeState({ status: "error", error: msg });
+    throw new Error(msg);
+  }
 }
 
 function extractOtp(text) {
@@ -287,13 +329,23 @@ async function startBaileys() {
   } = require("@whiskeysockets/baileys");
 
   const logger = P({ level: process.env.WA_LOG_LEVEL || "silent" });
+  const proxyAgent = makeProxyAgent();
+  const networkOptions = proxyAgent ? {
+    agent: proxyAgent,
+    fetchAgent: proxyAgent,
+    options: {
+      httpAgent: proxyAgent,
+      httpsAgent: proxyAgent,
+      proxy: false,
+    },
+  } : {};
   const authDir = path.join(sessionDir, "baileys-gopay");
   fs.mkdirSync(authDir, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
   let version;
   try {
-    const latest = await fetchLatestBaileysVersion();
+    const latest = await fetchLatestBaileysVersion(networkOptions.options || {});
     version = latest.version;
     console.log(`[wa] Baileys WA version: ${version.join(".")}`);
   } catch (e) {
@@ -312,6 +364,7 @@ async function startBaileys() {
     markOnlineOnConnect: false,
     syncFullHistory: true,
     generateHighQualityLinkPreview: false,
+    ...networkOptions,
   });
 
   let pairingRequested = false;
@@ -356,6 +409,7 @@ async function startBaileys() {
       const reason = String(lastDisconnect?.error?.message || lastDisconnect?.error || "");
       writeState({ status: "disconnected", reason, status_code: statusCode });
       console.log(`[wa] disconnected: ${reason || statusCode || "unknown"}`);
+      await flushStatePost();
       if (statusCode === DisconnectReason.loggedOut) {
         process.exit(0);
       }
@@ -380,6 +434,7 @@ async function startBaileys() {
 
   const shutdown = async (code) => {
     writeState({ status: "stopping" });
+    await flushStatePost();
     try { sock.end(new Error("sidecar shutdown")); } catch {}
     process.exit(code);
   };
@@ -448,7 +503,7 @@ function startWwebjs() {
 
   client.on("disconnected", (reason) => {
     writeState({ status: "disconnected", reason: String(reason || "") });
-    process.exit(0);
+    flushStatePost().finally(() => process.exit(0));
   });
 
   client.on("message", (msg) => {
@@ -462,27 +517,31 @@ function startWwebjs() {
 
   process.on("SIGTERM", async () => {
     writeState({ status: "stopping" });
+    await flushStatePost();
     try { await client.destroy(); } catch {}
     process.exit(0);
   });
 
   process.on("SIGINT", async () => {
     writeState({ status: "stopping" });
+    await flushStatePost();
     try { await client.destroy(); } catch {}
     process.exit(130);
   });
 
-  client.initialize().catch((e) => {
+  client.initialize().catch(async (e) => {
     writeState({ status: "error", error: String(e && e.stack || e) });
     console.error(e && e.stack || e);
+    await flushStatePost();
     process.exit(1);
   });
 }
 
 if (engine === "baileys") {
-  startBaileys().catch((e) => {
+  startBaileys().catch(async (e) => {
     writeState({ status: "error", error: String(e && e.stack || e) });
     console.error(e && e.stack || e);
+    await flushStatePost();
     process.exit(1);
   });
 } else if (engine === "wwebjs" || engine === "whatsapp-web.js") {

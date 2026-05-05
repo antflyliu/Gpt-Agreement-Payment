@@ -248,10 +248,23 @@ def apply_sidecar_state(payload: dict) -> dict:
     if not isinstance(payload, dict):
         payload = {}
     state = _read_state()
+    incoming_sidecar_ts = _as_float(payload.get("updated_at"))
+    current_sidecar_ts = _as_float(state.get("sidecar_updated_at"))
+    if incoming_sidecar_ts and current_sidecar_ts and incoming_sidecar_ts < current_sidecar_ts:
+        return state
     state.update(payload)
+    if incoming_sidecar_ts:
+        state["sidecar_updated_at"] = incoming_sidecar_ts
     state["updated_at"] = time.time()
     _write_state(state)
     return state
+
+
+def _as_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def submit_manual_otp(value: str) -> dict:

@@ -102,6 +102,38 @@ def test_whatsapp_session_snapshot_roundtrip(tmp_path, monkeypatch):
     assert not db.has_runtime_key("wa_session_snapshot")
 
 
+def test_whatsapp_sidecar_state_ignores_stale_updates(tmp_path, monkeypatch):
+    from webui.backend import wa_relay
+    from webui.backend.db import get_db
+
+    monkeypatch.setenv("WEBUI_DATA_DIR", str(tmp_path))
+    db = get_db()
+    db.delete_runtime_key("wa_state")
+
+    latest = wa_relay.apply_sidecar_state({
+        "status": "disconnected",
+        "reason": "Opening handshake has timed out",
+        "updated_at": 200.0,
+    })
+    assert latest["status"] == "disconnected"
+    assert latest["sidecar_updated_at"] == 200.0
+
+    stale = wa_relay.apply_sidecar_state({
+        "status": "connecting",
+        "updated_at": 100.0,
+    })
+    assert stale["status"] == "disconnected"
+    assert stale["reason"] == "Opening handshake has timed out"
+
+    fresh = wa_relay.apply_sidecar_state({
+        "status": "awaiting_qr_scan",
+        "qr": "qr",
+        "updated_at": 300.0,
+    })
+    assert fresh["status"] == "awaiting_qr_scan"
+    assert fresh["sidecar_updated_at"] == 300.0
+
+
 def test_whatsapp_start_error_returns_400(client, monkeypatch):
     _login(client)
 
