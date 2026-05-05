@@ -21,7 +21,6 @@ def test_run_preview_single(client):
     r = client.post("/api/run/preview", json={"mode": "single"})
     assert r.status_code == 200
     body = r.json()
-    assert "xvfb-run" in body["cmd_str"]
     assert "pipeline.py" in body["cmd_str"]
     assert "--paypal" in body["cmd_str"]
 
@@ -90,7 +89,9 @@ def test_run_start_then_409(client, monkeypatch):
             self.returncode = -9
 
     fake_procs: list = []
+    popen_calls: list = []
     def fake_popen(cmd, **kwargs):
+        popen_calls.append((cmd, kwargs))
         p = FakeProc()
         fake_procs.append(p)
         return p
@@ -99,6 +100,8 @@ def test_run_start_then_409(client, monkeypatch):
     # and flip _proc to "terminated" before our assertions.
     monkeypatch.setattr(runner_mod, "_drain", lambda proc: None)
     monkeypatch.setattr(runner_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runner_mod.os, "name", "nt")
+    monkeypatch.setattr(runner_mod.sys, "executable", r"C:\Python312\python.exe")
 
     # Bypass config health gate — this test focuses on the runner state
     # machine, not config validation (covered separately in test_config_health).
@@ -118,6 +121,8 @@ def test_run_start_then_409(client, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["running"] is True
+    assert popen_calls[0][0][0] != "xvfb-run"
+    assert popen_calls[0][0][1:3] == ["-u", "pipeline.py"]
 
     r = client.post("/api/run/start", json={"mode": "single"})
     assert r.status_code == 409
@@ -145,3 +150,43 @@ def test_gopay_auto_otp_skips_manual_fifo(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_mod.s, "PAY_CONFIG_PATH", cfg)
 
     assert runner_mod._gopay_auto_otp_enabled() is True
+
+
+def test_runner_uses_current_python_when_xvfb_unavailable(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.os, "name", "nt")
+    monkeypatch.setattr(runner_mod.sys, "executable", r"C:\Python312\python.exe")
+
+    cmd = runner_mod.build_cmd(
+        "single",
+        True,
+        batch=0,
+        workers=3,
+        self_dealer=0,
+        register_only=False,
+        pay_only=False,
+    )
+
+    assert cmd[:3] == [r"C:\Python312\python.exe", "-u", "pipeline.py"]
+    assert "xvfb-run" not in cmd
+
+
+def test_runner_uses_xvfb_on_posix_when_available(monkeypatch):
+    import webui.backend.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod.os, "name", "posix")
+    monkeypatch.setattr(runner_mod.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(runner_mod.shutil, "which", lambda name: "/usr/bin/xvfb-run" if name == "xvfb-run" else None)
+
+    cmd = runner_mod.build_cmd(
+        "single",
+        True,
+        batch=0,
+        workers=3,
+        self_dealer=0,
+        register_only=False,
+        pay_only=False,
+    )
+
+    assert cmd[:5] == ["/usr/bin/xvfb-run", "-a", "/usr/bin/python3", "-u", "pipeline.py"]

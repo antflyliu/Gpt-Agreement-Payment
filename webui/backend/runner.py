@@ -1,7 +1,8 @@
 """单 active-run 的 pipeline 进程控制器。
 
-封装 `xvfb-run -a python pipeline.py [args]` 子进程：spawn / 流式收 stdout
-到环形日志缓冲 / SIGTERM-优先 stop / 暴露 status + log 给路由层。
+封装 `pipeline.py [args]` 子进程：Linux 优先经 `xvfb-run`，Windows 直接
+使用当前 Python 解释器。负责 spawn / 流式收 stdout 到环形日志缓冲 /
+SIGTERM-优先 stop / 暴露 status + log 给路由层。
 
 GoPay 模式下额外支持 OTP 中转：默认通过 WebUI 内部 HTTP endpoint
 把 WhatsApp / 手动补录 OTP 写入 SQLite，gopay.py 轮询该 endpoint。
@@ -11,7 +12,9 @@ file provider 的兼容 fallback。
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -69,12 +72,25 @@ def _gopay_auto_otp_enabled() -> bool:
     return False
 
 
+def _pipeline_base_cmd() -> list[str]:
+    """Return the platform-safe launcher for pipeline.py.
+
+    Linux deployments use xvfb-run when available. Windows must not call the
+    WSL xvfb-run.cmd shim with Windows paths, so it launches the current Python
+    interpreter directly.
+    """
+    python = sys.executable or "python"
+    xvfb = shutil.which("xvfb-run") if os.name != "nt" else None
+    if xvfb:
+        return [xvfb, "-a", python, "-u", "pipeline.py"]
+    return [python, "-u", "pipeline.py"]
+
+
 def build_cmd(mode: str, paypal: bool, batch: int, workers: int, self_dealer: int,
               register_only: bool, pay_only: bool, gopay: bool = False,
               gopay_otp_file: str = "", count: int = 0) -> list[str]:
     """根据参数拼出最终命令行。"""
-    cmd = ["xvfb-run", "-a", "python", "-u", "pipeline.py",
-           "--config", str(s.PAY_CONFIG_PATH)]
+    cmd = [*_pipeline_base_cmd(), "--config", str(s.PAY_CONFIG_PATH)]
     # free_only 两个子模式不需要 paypal / gopay 支付段
     if mode in ("free_register", "free_backfill_rt"):
         if mode == "free_register":
