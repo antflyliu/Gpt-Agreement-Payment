@@ -4528,6 +4528,127 @@ def _drive_gopay_from_redirect(
     _log(f"      [gopay] 完成: {result}")
 
 
+# ---------------------------------------------------------------------------
+# 日本地址 API — meiguodizhi.com
+# ---------------------------------------------------------------------------
+_MEIGUODIZHI_BASE = "https://www.meiguodizhi.com"
+
+# 中文辖区 → 空格分隔拼音（47 个）
+_JP_PREFECTURES: dict[str, str] = {
+    "北海道": "bei hai dao",
+    "青森": "qing sen",
+    "岩手": "yan sheng",
+    "宫城": "gong cheng",
+    "秋田": "qiu tian",
+    "山形": "shan xing",
+    "福岛": "fu dao",
+    "茨城县": "zi qi",
+    "栃木": "qiao mu",
+    "群马": "qun ma",
+    "埼玉": "qi yu",
+    "千叶": "qian ye",
+    "东京都": "dong jing du",
+    "神奈川": "shen nai xian",
+    "新潟": "xin xie",
+    "富山": "fu shan",
+    "石川": "shi chuan",
+    "福井": "fu jing",
+    "山梨": "shan li",
+    "长野": "chang ye",
+    "岐阜": "qi fu",
+    "静冈": "jing gang",
+    "爱知": "ai zhi",
+    "三重": "san zhong",
+    "滋贺": "zi he",
+    "京都府": "jing du fu",
+    "大阪府": "da ban fu",
+    "兵库": "bing ku",
+    "奈良": "nei lang",
+    "和歌山": "he ge shan",
+    "鸟取": "niao qu",
+    "岛根": "dao gen",
+    "冈山": "gang shan",
+    "广岛": "guang dao",
+    "山口": "shan kou",
+    "德岛": "de dao",
+    "香川": "xiang chuan",
+    "爱媛": "ai yuan",
+    "高知": "gao zhi",
+    "福冈": "fu gang",
+    "佐贺": "zuo ga",
+    "长崎": "chang qi",
+    "熊本": "xiong ben",
+    "大分": "da fen",
+    "宫崎": "gong qi",
+    "鹿儿岛": "lu er dao",
+    "冲绳": "chong sheng",
+}
+
+_MGZH_PATH: dict[str, str] = {
+    "JP": "/jp-address",
+    "US": "/",
+    "UK": "/uk-address",
+    "SG": "/sg-address",
+}
+
+
+def _fetch_meiguodizhi_address(country: str) -> dict | None:
+    """调用 meiguodizhi API 获取真实地址。
+
+    country: JP / US / UK / SG，决定 path 和是否需要 city 参数。
+    成功返回 dict {line1, city, postal_code, state, country}，失败返回 None。
+    """
+    country = (country or "JP").upper()
+    path = _MGZH_PATH.get(country, "/jp-address")
+
+    payload: dict = {"path": path, "method": "refresh"}
+    if country == "JP":
+        prefecture_cn = random.choice(list(_JP_PREFECTURES.keys()))
+        payload["city"] = _JP_PREFECTURES[prefecture_cn]
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "content-type": "application/json",
+        "origin": _MEIGUODIZHI_BASE,
+        "referer": f"{_MEIGUODIZHI_BASE}{path}",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36"
+        ),
+    }
+
+    try:
+        resp = requests.post(
+            f"{_MEIGUODIZHI_BASE}/api/v1/dz",
+            json=payload,
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            _log(f"      [mgzh] HTTP {resp.status_code}: {resp.text[:200]}")
+            return None
+        body = resp.json()
+        addr_data = body.get("address") or {}
+        if not addr_data:
+            _log(f"      [mgzh] 响应无 address 字段: {resp.text[:200]}")
+            return None
+        return {
+            "line1": addr_data.get("Address") or "",
+            "city": addr_data.get("City") or "",
+            "postal_code": addr_data.get("Zip_Code") or "",
+            "state": addr_data.get("State") or "",
+            "country": country,
+        }
+    except Exception as exc:
+        _log(f"      [mgzh] 请求异常: {exc}")
+        return None
+
+
 def create_gopay_payment_method(
     session: requests.Session,
     pk: str,
@@ -4542,6 +4663,16 @@ def create_gopay_payment_method(
     muid = ctx.get("muid") or _gen_fingerprint()[0]
     sid  = ctx.get("sid")  or _gen_fingerprint()[0]
     addr = card.get("address", {}) if card else {}
+    # 动态获取真实地址：JP/US/UK/SG 四地区调用 meiguodizhi API
+    country = (addr.get("country") or "JP").upper()
+    if country in _MGZH_PATH:
+        api_addr = _fetch_meiguodizhi_address(country)
+        if api_addr:
+            addr = api_addr
+            _log(f"      [gopay] 地址来自 meiguodizhi: {addr.get('city')}, {addr.get('state')} {addr.get('postal_code')}")
+        else:
+            _log(f"      [gopay] meiguodizhi API 失败，使用 config 静态地址")
+
     runtime_version = ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION
     stripe_js_id = ctx.get("stripe_js_id", str(uuid.uuid4()))
     elements_session_id = ctx.get("elements_session_id", _gen_elements_session_id())
