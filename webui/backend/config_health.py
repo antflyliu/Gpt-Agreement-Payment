@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -287,6 +288,37 @@ def _check_registration_config(checks: list[dict], req: dict, reg_cfg: dict) -> 
         )
 
 
+def _gopay_pin_available(raw: Any) -> bool:
+    value = _text(raw)
+    if not value:
+        return False
+    if not value.upper().startswith("YOUR_"):
+        return True
+    pin = _text(os.getenv("WEBUI_GOPAY_PIN") or os.getenv("GOPAY_PIN") or os.getenv("YOUR_6_DIGIT_GOPAY_PIN"))
+    return bool(re.fullmatch(r"\d{6}", pin))
+
+
+def _gopay_phone_available(raw: Any) -> bool:
+    value = _text(raw)
+    if not value:
+        return False
+    if not value.upper().startswith("YOUR_"):
+        return True
+    phone = _text(os.getenv("WEBUI_GOPAY_PHONE") or os.getenv("GOPAY_PHONE_NUMBER") or os.getenv("YOUR_PHONE_NUMBER"))
+    return len(re.sub(r"\D", "", phone)) >= 8
+
+
+def _missing_gopay_paths(gp: dict) -> list[str]:
+    missing: list[str] = []
+    if _is_missing(gp.get("country_code")):
+        missing.append("country_code")
+    if not _gopay_phone_available(gp.get("phone_number")):
+        missing.append("phone_number")
+    if not _gopay_pin_available(gp.get("pin")):
+        missing.append("pin")
+    return missing
+
+
 def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
     kind = _payment_kind(req)
     if kind == "none":
@@ -295,10 +327,7 @@ def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
 
     if kind == "gopay":
         gp = pay_cfg.get("gopay") if isinstance(pay_cfg.get("gopay"), dict) else {}
-        missing = [
-            key for key in ("country_code", "phone_number", "pin")
-            if _is_missing(gp.get(key))
-        ]
+        missing = _missing_gopay_paths(gp)
         if missing:
             _check(
                 checks,
@@ -306,7 +335,7 @@ def _check_payment_config(checks: list[dict], req: dict, pay_cfg: dict) -> None:
                 "fail",
                 "GoPay 支付配置不完整",
                 missing=[f"gopay.{x}" for x in missing],
-                action="在配置向导 GoPay 步骤填写国家码、手机号和 6 位 PIN 后重新导出",
+                action="在运行环境设置 WEBUI_GOPAY_PHONE/GOPAY_PHONE_NUMBER/YOUR_PHONE_NUMBER 和 WEBUI_GOPAY_PIN/GOPAY_PIN/YOUR_6_DIGIT_GOPAY_PIN，或确认导出的 GoPay 占位符配置完整",
             )
         else:
             _check(checks, "gopay_config", "ok", "GoPay 支付配置已配置", blocking=False)

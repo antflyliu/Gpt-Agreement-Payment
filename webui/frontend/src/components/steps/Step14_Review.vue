@@ -51,7 +51,54 @@ interface ExportResult {
 }
 const result = ref<ExportResult | null>(null);
 
-const prettyAll = computed(() => JSON.stringify(store.answers, null, 2));
+const SENSITIVE_KEYS = new Set([
+  "phone_number",
+  "pin",
+  "password",
+  "token",
+  "api_key",
+  "client_key",
+  "cf_token",
+  "admin_key",
+  "number",
+  "cvc",
+  "auth_code",
+  "secret",
+  "client_secret",
+]);
+
+function withGopayPlaceholders(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const answers = value as Record<string, unknown>;
+  const gopay = answers.gopay;
+  if (!gopay || typeof gopay !== "object" || Array.isArray(gopay)) return answers;
+  return {
+    ...answers,
+    gopay: {
+      ...(gopay as Record<string, unknown>),
+      phone_number: "YOUR_PHONE_NUMBER",
+      pin: "YOUR_6_DIGIT_GOPAY_PIN",
+    },
+  };
+}
+
+function isVisiblePlaceholder(value: unknown): boolean {
+  return typeof value === "string" && value.trim().toUpperCase().startsWith("YOUR_");
+}
+
+function redact(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redact);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      key,
+      SENSITIVE_KEYS.has(key) ? (isVisiblePlaceholder(item) ? item : "***REDACTED***") : redact(item),
+    ]),
+  );
+}
+
+const redactedAnswers = computed(() => redact(withGopayPlaceholders(store.answers)));
+const prettyAll = computed(() => JSON.stringify(redactedAnswers.value, null, 2));
 
 async function exportConfigs() {
   loading.value = true;

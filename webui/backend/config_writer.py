@@ -14,10 +14,32 @@ def _deep_merge(dst: dict, src: dict) -> dict:
     return dst
 
 
-def _backup(path: Path) -> Path | None:
+def _redact_gopay_credentials(config: dict) -> dict:
+    clean = dict(config)
+    gopay = clean.get("gopay")
+    if isinstance(gopay, dict):
+        redacted = dict(gopay)
+        if "phone_number" in redacted:
+            redacted["phone_number"] = "YOUR_PHONE_NUMBER"
+        if "pin" in redacted:
+            redacted["pin"] = "YOUR_6_DIGIT_GOPAY_PIN"
+        clean["gopay"] = redacted
+    return clean
+
+
+def _backup(path: Path, *, redact_gopay: bool = False) -> Path | None:
     if not path.exists():
         return None
     bak = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
+    if redact_gopay:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if isinstance(data, dict):
+            data = _redact_gopay_credentials(data)
+        bak.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return bak
     bak.write_bytes(path.read_bytes())
     return bak
 
@@ -41,21 +63,21 @@ def _project_pay(answers: dict) -> dict:
         out["team_system"] = answers["team_system"]
     if "cpa" in answers:
         out["cpa"] = answers["cpa"]
-    if pm == "gopay" and "gopay" in answers:
-        gp = answers["gopay"] or {}
-        if all(gp.get(k) for k in ("country_code", "phone_number", "pin")):
-            out["gopay"] = {
-                "country_code": str(gp["country_code"]).lstrip("+"),
-                "phone_number": str(gp["phone_number"]),
-                "pin": str(gp["pin"]),
-            }
-            if gp.get("midtrans_client_id"):
-                out["gopay"]["midtrans_client_id"] = gp["midtrans_client_id"]
-            out["gopay"]["otp"] = {
-                "source": "auto",
-                "timeout": int(gp.get("otp_timeout") or 300),
-                "interval": 1,
-            }
+    if pm == "gopay":
+        gp = answers.get("gopay") or {}
+        country_code = str(gp.get("country_code") or "86").lstrip("+")
+        out["gopay"] = {
+            "country_code": country_code,
+            "phone_number": "YOUR_PHONE_NUMBER",
+            "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+        }
+        if gp.get("midtrans_client_id"):
+            out["gopay"]["midtrans_client_id"] = gp["midtrans_client_id"]
+        out["gopay"]["otp"] = {
+            "source": "auto",
+            "timeout": int(gp.get("otp_timeout") or 300),
+            "interval": 1,
+        }
     if "team_plan" in answers:
         tp = answers["team_plan"] or {}
         plan: dict = {}
@@ -198,7 +220,7 @@ def write_configs(answers: dict) -> dict:
 
     backups = []
     for p in (s.PAY_CONFIG_PATH, s.REG_CONFIG_PATH):
-        b = _backup(p)
+        b = _backup(p, redact_gopay=p == s.PAY_CONFIG_PATH)
         if b:
             backups.append(str(b))
 

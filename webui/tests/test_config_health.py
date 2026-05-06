@@ -79,11 +79,41 @@ def test_config_health_ok_with_cloudflare_secrets(client, tmp_path, monkeypatch)
     assert not body["blocking"]
 
 
+def test_config_health_accepts_gopay_placeholders_with_env(client, tmp_path, monkeypatch):
+    _login(client)
+    pay_path, _ = _seed_configs(tmp_path, monkeypatch)
+    pay_path.write_text(json.dumps({
+        "gopay": {
+            "country_code": "86",
+            "phone_number": "YOUR_PHONE_NUMBER",
+            "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+            "otp": {"source": "auto"},
+        },
+        "fresh_checkout": {"auth": {"session_token": "sess-123"}},
+    }), encoding="utf-8")
+    db = get_db()
+    db.clear_runtime_data()
+    db.set_runtime_json("secrets", {
+        "cloudflare": {
+            "api_token": "tok-abc",
+            "account_id": "acct-123",
+            "otp_kv_namespace_id": "kv-123",
+        }
+    })
+    monkeypatch.setenv("WEBUI_GOPAY_PHONE", "18613866248")
+    monkeypatch.setenv("WEBUI_GOPAY_PIN", "123456")
+
+    r = client.post("/api/config/health", json={"mode": "single", "paypal": False, "gopay": True})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert not [c for c in body["blocking"] if c["name"] == "gopay_config"]
+
+
 def test_run_start_blocked_by_config_health(client, tmp_path, monkeypatch):
     _login(client)
     _seed_configs(tmp_path, monkeypatch)
 
-    from webui.backend.db import get_db
     get_db().clear_runtime_data()
 
     r = client.post("/api/run/start", json={"mode": "single", "paypal": True})

@@ -1,8 +1,8 @@
 {
   "gopay": {
-    "_comment": "GoPay 支付配置。默认不填 otp 时回退 CLI；WebUI 运行时会注入 SQLite-backed HTTP OTP endpoint。",
+    "_comment": "GoPay 支付。YOUR_* 的 pin/phone_number 可从环境变量读取：WEBUI_GOPAY_PIN/GOPAY_PIN、WEBUI_GOPAY_PHONE/GOPAY_PHONE_NUMBER。默认不填 otp 时回退 CLI；WebUI 会注入 OTP HTTP endpoint。",
     "country_code": "62",
-    "phone_number": "81234567890",
+    "phone_number": "YOUR_PHONE_NUMBER",
     "pin": "YOUR_6_DIGIT_GOPAY_PIN",
     "otp": {
       "source": "auto",

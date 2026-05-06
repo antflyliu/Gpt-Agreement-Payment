@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import importlib.util
 import json
 import os
 import re
@@ -45,6 +46,17 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+_ENV_PLACEHOLDER_PATH = Path(__file__).resolve().parent / "env_placeholder.py"
+_ENV_PLACEHOLDER_SPEC = importlib.util.spec_from_file_location(
+    "ctf_pay_env_placeholder", _ENV_PLACEHOLDER_PATH
+)
+if _ENV_PLACEHOLDER_SPEC is None or _ENV_PLACEHOLDER_SPEC.loader is None:
+    raise ImportError(f"cannot load env_placeholder from {_ENV_PLACEHOLDER_PATH}")
+_env_placeholder = importlib.util.module_from_spec(_ENV_PLACEHOLDER_SPEC)
+_ENV_PLACEHOLDER_SPEC.loader.exec_module(_env_placeholder)
+PlaceholderResolutionError = _env_placeholder.PlaceholderResolutionError
+resolve_placeholder = _env_placeholder.resolve_placeholder
 
 import requests
 
@@ -100,6 +112,48 @@ class GoPayPINRejected(GoPayError):
     pass
 
 
+def _validate_gopay_pin_from_env(v: str) -> None:
+    if not re.fullmatch(r"\d{6}", v):
+        raise PlaceholderResolutionError(
+            "GoPay PIN from environment must be exactly 6 digits"
+        )
+
+
+def _validate_gopay_phone_from_env(v: str) -> None:
+    digits = re.sub(r"\D", "", v)
+    if len(digits) < 8:
+        raise PlaceholderResolutionError(
+            "GoPay phone from environment must yield at least 8 digits "
+            f"(got {len(digits)} after removing non-digits)"
+        )
+
+
+def _resolve_gopay_pin(raw: str) -> str:
+    """占位符时从 WEBUI_GOPAY_PIN / GOPAY_PIN 读取 6 位 PIN。"""
+    try:
+        return resolve_placeholder(
+            raw,
+            ("WEBUI_GOPAY_PIN", "GOPAY_PIN", "YOUR_6_DIGIT_GOPAY_PIN"),
+            label="gopay.pin",
+            validate=_validate_gopay_pin_from_env,
+        )
+    except PlaceholderResolutionError as e:
+        raise GoPayError(str(e)) from e
+
+
+def _resolve_gopay_phone(raw: str) -> str:
+    """占位符时从 WEBUI_GOPAY_PHONE / GOPAY_PHONE_NUMBER 读取号码（可含 +、空格）。"""
+    try:
+        return resolve_placeholder(
+            raw,
+            ("WEBUI_GOPAY_PHONE", "GOPAY_PHONE_NUMBER", "YOUR_PHONE_NUMBER"),
+            label="gopay.phone_number",
+            validate=_validate_gopay_phone_from_env,
+        )
+    except PlaceholderResolutionError as e:
+        raise GoPayError(str(e)) from e
+
+
 # ──────────────────────────── core ────────────────────────────────
 
 
@@ -126,8 +180,8 @@ class GoPayCharger:
     ):
         self.cs = chatgpt_session
         self.country_code = str(gopay_cfg["country_code"]).lstrip("+")
-        self.phone = re.sub(r"\D", "", str(gopay_cfg["phone_number"]))
-        self.pin = str(gopay_cfg["pin"])
+        self.phone = re.sub(r"\D", "", _resolve_gopay_phone(str(gopay_cfg["phone_number"])))
+        self.pin = _resolve_gopay_pin(str(gopay_cfg["pin"]))
         self.midtrans_client_id = str(
             gopay_cfg.get("midtrans_client_id") or DEFAULT_MIDTRANS_CLIENT_ID
         )

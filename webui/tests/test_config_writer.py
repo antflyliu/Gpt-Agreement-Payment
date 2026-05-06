@@ -71,14 +71,46 @@ def test_export_backs_up_existing(client, tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
 
     pay_path = tmp_path / "CTF-pay" / "config.paypal.json"
+    reg_path = tmp_path / "CTF-reg" / "config.paypal-proxy.json"
     pay_path.parent.mkdir(parents=True, exist_ok=True)
+    reg_path.parent.mkdir(parents=True, exist_ok=True)
     pay_path.write_text(json.dumps({"old": True}))
+    reg_path.write_text(json.dumps({"old_reg": True}))
 
     client.post("/api/config/export", json={"answers": {}})
 
-    backups = list((tmp_path / "CTF-pay").glob("config.paypal.json.bak.*"))
-    assert len(backups) == 1
-    assert json.loads(backups[0].read_text()) == {"old": True}
+    pay_backups = list((tmp_path / "CTF-pay").glob("config.paypal.json.bak.*"))
+    reg_backups = list((tmp_path / "CTF-reg").glob("config.paypal-proxy.json.bak.*"))
+    assert len(pay_backups) == 1
+    assert len(reg_backups) == 1
+    assert json.loads(pay_backups[0].read_text()) == {"old": True}
+    assert json.loads(reg_backups[0].read_text()) == {"old_reg": True}
+
+
+def test_export_redacts_gopay_credentials_in_backup(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed(tmp_path, monkeypatch)
+
+    pay_path = tmp_path / "CTF-pay" / "config.paypal.json"
+    pay_path.parent.mkdir(parents=True, exist_ok=True)
+    pay_path.write_text(json.dumps({
+        "gopay": {
+            "country_code": "86",
+            "phone_number": "18613866248",
+            "pin": "19628",
+        }
+    }))
+
+    r = client.post("/api/config/export", json={"answers": {"payment": {"method": "gopay"}}})
+    assert r.status_code == 200
+
+    backup = next((tmp_path / "CTF-pay").glob("config.paypal.json.bak.*"))
+    backup_text = backup.read_text()
+    backup_config = json.loads(backup_text)
+    assert backup_config["gopay"]["phone_number"] == "YOUR_PHONE_NUMBER"
+    assert backup_config["gopay"]["pin"] == "YOUR_6_DIGIT_GOPAY_PIN"
+    assert "18613866248" not in backup_text
+    assert "19628" not in backup_text
 
 
 def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
@@ -89,8 +121,37 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
         "payment": {"method": "gopay"},
         "gopay": {
             "country_code": "62",
-            "phone_number": "81234567890",
-            "pin": "123456",
+            "phone_number": "FAKE_GOPAY_PHONE_FROM_WIZARD",
+            "pin": "FAKE_GOPAY_PIN_FROM_WIZARD",
+            "otp_timeout": 240,
+        },
+    }
+    r = client.post("/api/config/export", json={"answers": answers})
+    assert r.status_code == 200
+
+    pay_path = tmp_path / "CTF-pay" / "config.paypal.json"
+    pay = json.loads(pay_path.read_text())
+    assert pay["gopay"]["country_code"] == "62"
+    assert pay["gopay"]["phone_number"] == "YOUR_PHONE_NUMBER"
+    assert pay["gopay"]["pin"] == "YOUR_6_DIGIT_GOPAY_PIN"
+    assert "FAKE_GOPAY_PHONE_FROM_WIZARD" not in pay_path.read_text()
+    assert "FAKE_GOPAY_PIN_FROM_WIZARD" not in pay_path.read_text()
+    assert pay["gopay"]["otp"]["source"] == "auto"
+    assert "path" not in pay["gopay"]["otp"]
+    assert "url" not in pay["gopay"]["otp"]
+    assert pay["gopay"]["otp"]["timeout"] == 240
+    assert pay["gopay"]["otp"]["interval"] == 1
+
+
+
+def test_export_writes_gopay_placeholders_without_stored_credentials(client, tmp_path, monkeypatch):
+    _login(client)
+    _seed(tmp_path, monkeypatch)
+
+    answers = {
+        "payment": {"method": "gopay"},
+        "gopay": {
+            "country_code": "62",
             "otp_timeout": 240,
         },
     }
@@ -99,12 +160,9 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
 
     pay = json.loads((tmp_path / "CTF-pay" / "config.paypal.json").read_text())
     assert pay["gopay"]["country_code"] == "62"
-    assert pay["gopay"]["phone_number"] == "81234567890"
-    assert pay["gopay"]["otp"]["source"] == "auto"
-    assert "path" not in pay["gopay"]["otp"]
-    assert "url" not in pay["gopay"]["otp"]
+    assert pay["gopay"]["phone_number"] == "YOUR_PHONE_NUMBER"
+    assert pay["gopay"]["pin"] == "YOUR_6_DIGIT_GOPAY_PIN"
     assert pay["gopay"]["otp"]["timeout"] == 240
-    assert pay["gopay"]["otp"]["interval"] == 1
 
 
 def test_export_writes_hosted_checkout_link_mode(client, tmp_path, monkeypatch):
