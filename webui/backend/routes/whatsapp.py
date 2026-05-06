@@ -47,6 +47,10 @@ def get_or_create_token() -> str:
     return wa_relay.relay_token()
 
 
+class IngestRequest(BaseModel):
+    otp: str
+
+
 def _check_relay_token(token: str = "", x_wa_relay_token: str = "") -> None:
     got = token or x_wa_relay_token or ""
     expected = wa_relay.relay_token()
@@ -140,3 +144,47 @@ def receive_external_otp(
 def show_token(_: str = CurrentUser):
     """Return the current OTP token for forwarder configuration."""
     return {"token": get_or_create_token()}
+
+
+@router.post("/ingest")
+def ingest_otp(
+    req: IngestRequest,
+    token: str = "",
+    x_wa_relay_token: str = Header(default=""),
+):
+    _check_relay_token(token=token, x_wa_relay_token=x_wa_relay_token)
+    if not runner.status().get("otp_pending"):
+        raise HTTPException(
+            status_code=409,
+            detail="OTP API closed (no OTP currently requested by pipeline)",
+        )
+    try:
+        item = wa_relay.submit_manual_otp(req.otp)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "item": item}
+
+
+@router.get("/ingest-info")
+def ingest_info(user: str = CurrentUser):
+    return {
+        "path": "/api/whatsapp/ingest",
+        "method": "POST",
+        "token": wa_relay.relay_token(),
+        "header_name": "X-WA-Relay-Token",
+        "query_name": "token",
+        "active": bool(runner.status().get("otp_pending")),
+    }
+
+
+@router.get("/latest-otp-session")
+def latest_otp_session(
+    response: Response,
+    since: float = 0.0,
+    user: str = CurrentUser,
+):
+    item = wa_relay.latest_otp(since=since)
+    if not item:
+        response.status_code = 204
+        return None
+    return item

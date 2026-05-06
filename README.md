@@ -161,6 +161,17 @@ xvfb-run -a python pipeline.py --config CTF-pay/config.paypal.json --paypal --da
 | GitHub Issues | bug 报告与 PR（主入口） |
 特别感谢 LINUX DO 社区 —— 本项目最早的反馈来源、实测者、协议变化通报者都来自这里。
 ---
+
+## 赞赏
+
+如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕
+
+<p align="center">
+  <img src="goodgood.jpg" width="280" alt="赞赏码">
+</p>
+
+---
+
 ## Star History
 <a href="https://star-history.com/#DanOps-1/Gpt-Agreement-Payment&Date">
 <picture>
