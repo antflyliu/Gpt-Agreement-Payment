@@ -121,6 +121,24 @@ CREATE TABLE IF NOT EXISTS card_results (
 CREATE INDEX IF NOT EXISTS idx_card_results_email_session_id
   ON card_results(chatgpt_email, session_id, id);
 
+CREATE TABLE IF NOT EXISTS codex_auth_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_result_id INTEGER DEFAULT NULL,
+  chatgpt_email TEXT NOT NULL COLLATE NOCASE,
+  account_id TEXT DEFAULT '',
+  id_token TEXT NOT NULL,
+  access_token TEXT NOT NULL,
+  refresh_token TEXT NOT NULL,
+  scope TEXT DEFAULT '',
+  token_type TEXT DEFAULT '',
+  expires_at REAL DEFAULT 0,
+  last_refresh TEXT DEFAULT '',
+  auth_json TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_codex_auth_tokens_email_id
+  ON codex_auth_tokens(chatgpt_email, id);
+
 CREATE TABLE IF NOT EXISTS oauth_status (
   email TEXT PRIMARY KEY COLLATE NOCASE,
   status TEXT NOT NULL,
@@ -196,7 +214,7 @@ class Database:
         OTP provider.
         """
         with self._conn() as c:
-            for table in ("registered_accounts", "pipeline_results", "card_results", "oauth_status"):
+            for table in ("registered_accounts", "pipeline_results", "card_results", "codex_auth_tokens", "oauth_status"):
                 c.execute(f"DELETE FROM {table}")
             for key in ("daemon_state", "email_domain_state", "wa_state"):
                 c.execute("DELETE FROM runtime_meta WHERE key = ?", (key,))
@@ -441,10 +459,79 @@ class Database:
             out.append(d)
         return out
 
+    def _insert_codex_auth_token(self, c: sqlite3.Connection, record: dict) -> int:
+        cur = c.execute(
+            """
+            INSERT INTO codex_auth_tokens(
+              card_result_id, chatgpt_email, account_id, id_token, access_token,
+              refresh_token, scope, token_type, expires_at, last_refresh,
+              auth_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("card_result_id"),
+                _email(record.get("chatgpt_email")),
+                _text(record.get("account_id")),
+                _text(record.get("id_token")),
+                _text(record.get("access_token")),
+                _text(record.get("refresh_token")),
+                _text(record.get("scope")),
+                _text(record.get("token_type")),
+                float(record.get("expires_at") or 0),
+                _text(record.get("last_refresh")),
+                _text(record.get("auth_json")),
+                time.time(),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def add_codex_auth_token(self, record: dict) -> int:
+        with self._conn() as c:
+            return self._insert_codex_auth_token(c, record)
+
+    def list_codex_auth_tokens(self, limit: int = 100) -> list[dict]:
+        safe_limit = max(1, min(int(limit or 100), 500))
+        with self._conn() as c:
+            rows = c.execute(
+                """
+                SELECT
+                  id, card_result_id, chatgpt_email, account_id, scope, token_type,
+                  expires_at, last_refresh, created_at,
+                  length(id_token) > 0 AS has_id_token,
+                  length(access_token) > 0 AS has_access_token,
+                  length(refresh_token) > 0 AS has_refresh_token
+                FROM codex_auth_tokens
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_codex_auth_json(self, token_id: int) -> str | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT auth_json FROM codex_auth_tokens WHERE id = ?",
+                (int(token_id),),
+            ).fetchone()
+        return str(row["auth_json"]) if row else None
+
+    def get_codex_auth_export(self, token_id: int) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                """
+                SELECT chatgpt_email, auth_json
+                FROM codex_auth_tokens
+                WHERE id = ?
+                """,
+                (int(token_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
     def add_card_result(self, record: dict) -> bool:
         chatgpt_email = _email(record.get("chatgpt_email") or record.get("email"))
         with self._conn() as c:
-            c.execute(
+            cur = c.execute(
                 """
                 INSERT INTO card_results(
                   ts, status, chatgpt_email, email, session_id, channel, entity,
@@ -470,6 +557,12 @@ class Database:
                     time.time(),
                 ),
             )
+            codex_auth_token = record.get("codex_auth_token")
+            if isinstance(codex_auth_token, dict):
+                token_record = dict(codex_auth_token)
+                token_record["card_result_id"] = int(cur.lastrowid)
+                token_record.setdefault("chatgpt_email", chatgpt_email)
+                self._insert_codex_auth_token(c, token_record)
         return True
 
     def iter_card_results(self) -> list[dict]:

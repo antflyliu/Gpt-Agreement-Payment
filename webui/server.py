@@ -16,6 +16,7 @@ from .backend.routes import sniff as sniff_routes
 from .backend.routes import config as config_routes
 from .backend.routes import inventory as inventory_routes
 from .backend.routes import run as run_routes
+from .backend.routes import codex_tokens as codex_tokens_routes
 from .backend.routes import cloudflare_kv as cf_kv_routes
 from .backend.routes import whatsapp as whatsapp_routes
 
@@ -91,6 +92,7 @@ def create_app() -> FastAPI:
         config_routes.router,
         inventory_routes.router,
         run_routes.router,
+        codex_tokens_routes.router,
         cf_kv_routes.router,
         whatsapp_routes.router,
     )

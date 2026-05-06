@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from webui.backend.db import Database
 
@@ -58,3 +60,99 @@ def test_clear_runtime_data_preserves_durable_runtime_config(db):
     assert db.get_runtime_json("wa_session_snapshot", {})["data"] == "snapshot"
     assert db.get_runtime_json("daemon_state", {}) == {}
     assert db.get_runtime_json("wa_state", {}) == {}
+
+
+def test_codex_auth_tokens_crud(db):
+    auth_json = json.dumps(
+        {
+            "tokens": {
+                "id_token": "id_123",
+                "access_token": "access_123",
+                "refresh_token": "refresh_123",
+            },
+            "last_refresh": "2026-05-06T00:00:00Z",
+        }
+    )
+
+    token_id = db.add_codex_auth_token(
+        {
+            "card_result_id": 7,
+            "chatgpt_email": "buyer@example.com",
+            "account_id": "acct_123456789",
+            "id_token": "id_123",
+            "access_token": "access_123",
+            "refresh_token": "refresh_123",
+            "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke",
+            "token_type": "Bearer",
+            "expires_at": 1777777777.0,
+            "last_refresh": "2026-05-06T00:00:00Z",
+            "auth_json": auth_json,
+        }
+    )
+
+    rows = db.list_codex_auth_tokens()
+    assert len(rows) == 1
+    assert rows[0]["id"] == token_id
+    assert rows[0]["chatgpt_email"] == "buyer@example.com"
+    assert rows[0]["account_id"] == "acct_123456789"
+    assert rows[0]["has_id_token"] == 1
+    assert rows[0]["has_access_token"] == 1
+    assert rows[0]["has_refresh_token"] == 1
+    assert "id_123" not in rows[0].values()
+    assert db.get_codex_auth_json(token_id) == auth_json
+
+
+def test_clear_runtime_data_removes_codex_tokens(db):
+    token_id = db.add_codex_auth_token(
+        {
+            "card_result_id": None,
+            "chatgpt_email": "buyer@example.com",
+            "account_id": "acct_123",
+            "id_token": "id_123",
+            "access_token": "access_123",
+            "refresh_token": "refresh_123",
+            "scope": "openid",
+            "token_type": "Bearer",
+            "expires_at": 0,
+            "last_refresh": "2026-05-06T00:00:00Z",
+            "auth_json": "{}",
+        }
+    )
+
+    db.clear_runtime_data()
+
+    assert db.get_codex_auth_json(token_id) is None
+
+
+def test_add_card_result_persists_codex_auth_token(db):
+    assert db.add_card_result(
+        {
+            "ts": "2026-05-06T00:00:00Z",
+            "status": "succeeded",
+            "chatgpt_email": "buyer@example.com",
+            "email": "buyer@example.com",
+            "session_id": "sess_123",
+            "channel": "gopay",
+            "entity": "subscription",
+            "config": "{}",
+            "error": "",
+            "refresh_token": "refresh_123",
+            "codex_auth_token": {
+                "chatgpt_email": "buyer@example.com",
+                "account_id": "acct_123",
+                "id_token": "id_123",
+                "access_token": "access_123",
+                "refresh_token": "refresh_123",
+                "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke",
+                "token_type": "Bearer",
+                "expires_at": 1777777777.0,
+                "last_refresh": "2026-05-06T00:00:00Z",
+                "auth_json": "{}",
+            },
+        }
+    )
+
+    rows = db.list_codex_auth_tokens()
+    assert len(rows) == 1
+    assert rows[0]["card_result_id"] == 1
+    assert rows[0]["chatgpt_email"] == "buyer@example.com"

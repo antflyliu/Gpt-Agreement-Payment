@@ -5282,6 +5282,92 @@ def _fetch_openai_login_otp(target_email: str, timeout: int = 180) -> str:
 
 
 _OPENAI_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+_OPENAI_CODEX_SCOPE = "openid profile email offline_access api.connectors.read api.connectors.invoke"
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        decoded = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _utc_iso_from_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _cockpit_auth_json(id_token: str, access_token: str, refresh_token: str, last_refresh: str) -> str:
+    return json.dumps(
+        {
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+            "last_refresh": last_refresh,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _normalize_codex_oauth_token_response(token_response: dict, *, expected_email: str, now: float | None = None) -> dict:
+    id_token = str((token_response or {}).get("id_token") or "")
+    access_token = str((token_response or {}).get("access_token") or "")
+    refresh_token = str((token_response or {}).get("refresh_token") or "")
+    missing = [
+        name
+        for name, value in (("id_token", id_token), ("access_token", access_token), ("refresh_token", refresh_token))
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"missing required token fields: {', '.join(missing)}")
+
+    payload = _decode_jwt_payload(id_token)
+    token_email = str(payload.get("email") or "")
+    account_id = str(payload.get("sub") or payload.get("account_id") or "")
+    expected = str(expected_email or "").strip()
+    if token_email and expected and token_email.casefold() != expected.casefold():
+        raise ValueError("token email mismatch")
+    if not token_email and not account_id:
+        raise ValueError("token identity missing")
+
+    current = time.time() if now is None else now
+    expires_in = (token_response or {}).get("expires_in")
+    try:
+        expires_at = current + float(expires_in) if expires_in is not None else float(payload.get("exp") or 0)
+    except Exception:
+        expires_at = float(payload.get("exp") or 0)
+    last_refresh = _utc_iso_from_ts(current)
+    return {
+        "chatgpt_email": expected or token_email,
+        "account_id": account_id,
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "scope": str((token_response or {}).get("scope") or ""),
+        "token_type": str((token_response or {}).get("token_type") or ""),
+        "expires_at": expires_at,
+        "last_refresh": last_refresh,
+        "auth_json": _cockpit_auth_json(id_token, access_token, refresh_token, last_refresh),
+    }
+
+
+def _log_codex_token_success(token: dict, log=None) -> None:
+    emit = log or _log
+    emit(
+        "      [RT] Codex token 获取成功 "
+        f"id_token_len={len(token.get('id_token') or '')} "
+        f"access_token_len={len(token.get('access_token') or '')} "
+        f"refresh_token_len={len(token.get('refresh_token') or '')} "
+        f"scope={token.get('scope') or ''}"
+    )
 
 
 def _resolve_codex_oauth_client_id(*values: str) -> str:
@@ -5316,9 +5402,9 @@ def _codex_oauth_client_id_from_config(cfg: dict) -> str:
 
 def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: dict,
                                           proxy_url: str = "",
-                                          oauth_client_id: str = "") -> str:
+                                          oauth_client_id: str = "") -> dict | str:
     """
-    支付成功后重新登录换 refresh_token。
+    支付成功后重新登录换 Codex token。
     流程：
       1. Camoufox 打开 Codex authorize URL
       2. 重定向到 auth.openai.com/log-in
@@ -5326,7 +5412,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
       4. 可能触发 Turnstile (Camoufox 自动过) / OTP (IMAP 取)
       5. workspace/select (选择默认 workspace)
       6. 自动 authorize Codex client → localhost callback
-      7. POST /oauth/token 换 refresh_token
+      7. POST /oauth/token 换 Codex token
     """
     import base64 as _b64
     import hashlib as _hashlib
@@ -5349,7 +5435,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
         "client_id": codex_client_id,
         "response_type": "code",
         "redirect_uri": codex_redirect,
-        "scope": "openid email profile offline_access",
+        "scope": _OPENAI_CODEX_SCOPE,
         "state": codex_state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -5639,7 +5725,7 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
     if not code:
         _log(f"      [RT] callback 无 code: {cb_url[:150]}")
         return ""
-    _log(f"      [RT] 获得 code，POST /oauth/token 换 refresh_token ...")
+    _log("      [RT] 获得 code，POST /oauth/token 换 Codex token ...")
     try:
         from curl_cffi.requests import Session as CffiSession
         http_rt = CffiSession(impersonate="chrome136")
@@ -5662,7 +5748,9 @@ def _exchange_refresh_token_with_session(email: str, password: str, mail_cfg: di
             _log(f"      [RT] /oauth/token: {r.status_code} {r.text[:200]}")
             return ""
         tj = r.json()
-        return tj.get("refresh_token", "") or ""
+        normalized = _normalize_codex_oauth_token_response(tj, expected_email=email)
+        _log_codex_token_success(normalized)
+        return normalized
     except Exception as e_tok:
         _log(f"      [RT] /oauth/token 异常: {e_tok}")
         return ""
@@ -7663,8 +7751,8 @@ def _record_result(
     if error_msg:
         record["error"] = error_msg[:200]
     if extra:
-        # 只保留 refresh_token 和 team_account_id，不落盘 access_token/session_token
-        allowed = {"refresh_token", "team_account_id"}
+        # 只保留授权结果必要字段；完整 Codex token 仅进 SQLite 独立表，不写日志。
+        allowed = {"refresh_token", "team_account_id", "codex_auth_token"}
         for k, v in extra.items():
             if k in allowed and v:
                 record[k] = v
@@ -8975,19 +9063,20 @@ def run(
                     _log(f"      [RT] 读取 mail 配置失败: {e}")
 
             if _password and _mail_cfg:
-                _log("      [RT] 支付成功，重新登录拿 refresh_token ...")
-                rt_value = _exchange_refresh_token_with_session(
-	                    email=chatgpt_email,
-	                    password=_password,
-	                    mail_cfg=_mail_cfg,
-	                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
-	                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
-	                )
-                if rt_value:
-                    extra_info["refresh_token"] = rt_value
-                    _log(f"      [RT] ✅ 获得 refresh_token 长度={len(rt_value)}")
+                _log("      [RT] 支付成功，重新登录拿 Codex token ...")
+                codex_token = _exchange_refresh_token_with_session(
+                    email=chatgpt_email,
+                    password=_password,
+                    mail_cfg=_mail_cfg,
+                    proxy_url=_build_proxy_url_from_cfg(cfg.get("proxy")) if isinstance(cfg, dict) else "",
+                    oauth_client_id=_codex_oauth_client_id_from_config(cfg),
+                )
+                if codex_token:
+                    extra_info["refresh_token"] = codex_token.get("refresh_token", "")
+                    extra_info["codex_auth_token"] = codex_token
+                    _log_codex_token_success(codex_token)
                 else:
-                    _log("      [RT] ❌ refresh_token 获取失败（不影响支付结果）")
+                    _log("      [RT] ❌ Codex token 获取失败（不影响支付结果）")
             else:
                 _log(f"      [RT] 缺少条件，跳过 (password={bool(_password)} mail_cfg={bool(_mail_cfg)})")
         except Exception as e:
