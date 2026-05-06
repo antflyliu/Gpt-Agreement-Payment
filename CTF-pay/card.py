@@ -4497,12 +4497,15 @@ def _drive_gopay_from_redirect(
     复用 gopay 模块的 GoPayCharger.run_from_redirect。OTP 从 stdin（CLI）或
     file-watch（webui runner）取。
     """
-    import sys as _sys
+    import importlib.util as _importlib_util
     from pathlib import Path as _Path
-    here = _Path(__file__).resolve().parent
-    if str(here) not in _sys.path:
-        _sys.path.insert(0, str(here))
-    import gopay as _gopay
+
+    gopay_path = _Path(__file__).resolve().parent / "gopay.py"
+    gopay_spec = _importlib_util.spec_from_file_location("ctf_pay_gopay", gopay_path)
+    if gopay_spec is None or gopay_spec.loader is None:
+        raise RuntimeError(f"cannot load gopay from {gopay_path}")
+    _gopay = _importlib_util.module_from_spec(gopay_spec)
+    gopay_spec.loader.exec_module(_gopay)
 
     auth_cfg = (cfg.get("fresh_checkout") or {}).get("auth") or {}
     cs_session = _gopay._build_chatgpt_session(auth_cfg)
@@ -4649,6 +4652,32 @@ def _fetch_meiguodizhi_address(country: str) -> dict | None:
         return None
 
 
+def _prepare_gopay_billing_address(card: dict, cfg: dict) -> dict:
+    """Resolve the per-run GoPay billing address and store it on card."""
+    addr = dict((card or {}).get("address") or {})
+    fresh_cfg = (cfg or {}).get("fresh_checkout") or {}
+    plan_cfg = fresh_cfg.get("plan") or {}
+    plan_country = str(plan_cfg.get("billing_country") or "").strip().upper()
+    country = plan_country or str(addr.get("country") or "JP").strip().upper()
+
+    if country in _MGZH_PATH:
+        api_addr = _fetch_meiguodizhi_address(country)
+        if api_addr:
+            addr = dict(api_addr)
+            _log(
+                "      [gopay] 地址来自 meiguodizhi: "
+                f"{addr.get('city')}, {addr.get('state')} {addr.get('postal_code')}"
+            )
+        else:
+            _log("      [gopay] meiguodizhi API 失败，使用 config 静态地址")
+
+    if country:
+        addr["country"] = country
+    if card is not None:
+        card["address"] = addr
+    return addr
+
+
 def create_gopay_payment_method(
     session: requests.Session,
     pk: str,
@@ -4663,15 +4692,6 @@ def create_gopay_payment_method(
     muid = ctx.get("muid") or _gen_fingerprint()[0]
     sid  = ctx.get("sid")  or _gen_fingerprint()[0]
     addr = card.get("address", {}) if card else {}
-    # 动态获取真实地址：JP/US/UK/SG 四地区调用 meiguodizhi API
-    country = (addr.get("country") or "JP").upper()
-    if country in _MGZH_PATH:
-        api_addr = _fetch_meiguodizhi_address(country)
-        if api_addr:
-            addr = api_addr
-            _log(f"      [gopay] 地址来自 meiguodizhi: {addr.get('city')}, {addr.get('state')} {addr.get('postal_code')}")
-        else:
-            _log(f"      [gopay] meiguodizhi API 失败，使用 config 静态地址")
 
     runtime_version = ctx.get("runtime_version") or DEFAULT_STRIPE_RUNTIME_VERSION
     stripe_js_id = ctx.get("stripe_js_id", str(uuid.uuid4()))
@@ -8428,6 +8448,8 @@ def run(
     elif use_gopay:
         init_ctx["confirm_mode"] = "shared_payment_method"
         init_ctx["payment_method_type"] = "gopay"
+        _prepare_gopay_billing_address(card, cfg)
+        addr = card["address"]
     else:
         init_ctx["confirm_mode"] = runtime_cfg.get("confirm_mode", "inline_payment_method_data")
     # 把 processor_entity 透传给 manual_approval 阶段；默认 openai_llc（IDR/Plus 用）
@@ -8594,6 +8616,8 @@ def run(
                 )
         elif use_gopay:
             with _http_session_stage_proxy(http, stage_proxy_cfg, "payment_method"):
+                # GoPay 模式: 创建 type=gopay 的 payment_method，走 shared 模式
+                # 账单地址已在本次 run 内解析并写入 card["address"]，避免同一流程生成多份地址
                 pm_id = create_gopay_payment_method(
                     http, pk, card, session_id, stripe_ver, ctx=init_ctx
                 )
