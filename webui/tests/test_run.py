@@ -99,9 +99,8 @@ def test_run_start_then_409(client, monkeypatch):
     # Patch _drain to no-op so the daemon thread doesn't call proc.wait()
     # and flip _proc to "terminated" before our assertions.
     monkeypatch.setattr(runner_mod, "_drain", lambda proc: None)
+    monkeypatch.setattr(runner_mod, "_pipeline_base_cmd", lambda: [r"C:\Python312\python.exe", "-u", "pipeline.py"])
     monkeypatch.setattr(runner_mod.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(runner_mod.os, "name", "nt")
-    monkeypatch.setattr(runner_mod.sys, "executable", r"C:\Python312\python.exe")
 
     # Bypass config health gate — this test focuses on the runner state
     # machine, not config validation (covered separately in test_config_health).
