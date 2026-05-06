@@ -68,13 +68,20 @@ test_*.py
 webui/.omc
 webui/.pytest_cache
 webui/.venv
+webui/.venv_build/
 webui/_pycache_
+.venv_build/
 
 .specstory
 .vscode
 
 webui/frontend/dist
 webui/frontend/node_modules
+
+# 本地配置副本和临时排错文件
+CTF-pay/config.*副本.json
+/nvm_install.sh
+/错误记录.txt
 
 
 
