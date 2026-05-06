@@ -133,6 +133,39 @@ def _parse_proxy(proxy_url: str):
     }
 
 
+def _fill_email_input(page, email: str) -> bool:
+    for _try in range(4):
+        try:
+            ei = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]')
+            if not ei:
+                time.sleep(0.5)
+                continue
+            ei.evaluate("el => el.focus()")
+            time.sleep(0.2)
+            try:
+                page.keyboard.type(email, delay=random.randint(20, 60))
+            except Exception:
+                pass
+            ei2 = page.query_selector('input[type="email"]') or page.query_selector('input[name="email"]')
+            target = ei2 or ei
+            try:
+                current_value = target.evaluate("el => el.value")
+            except Exception:
+                current_value = ""
+            if current_value != email:
+                target.fill(email)
+            if target.evaluate("el => el.value") == email:
+                return True
+            time.sleep(0.5)
+        except Exception as e:
+            if "not attached" in str(e).lower() or "detached" in str(e).lower():
+                logger.info(f"[browser-reg] email input 脱链 重试 {_try+1}/4")
+                time.sleep(0.5)
+                continue
+            raise
+    return False
+
+
 def browser_register(cfg, mail_provider) -> dict:
     """
     用真实浏览器走注册流程。
@@ -264,26 +297,12 @@ def browser_register(cfg, mail_provider) -> dict:
             logger.info(f"[browser-reg] 当前 URL: {page.url[:120]}")
             page.screenshot(path="/tmp/browser_reg_before_email.png")
 
-            # [2] 填邮箱（click + fill 分步，React 重渲染可能让 handle 失效 → 每步重新 query）
+            # [2] 填邮箱（focus + keyboard.type；React 重渲染可能让 handle 失效 → 必要时重新 query/fill 兜底）
             logger.info("[browser-reg] 填邮箱 ...")
             page.wait_for_selector('input[type="email"], input[name="email"]', timeout=30000)
-            for _try in range(4):
-                try:
-                    ei = page.query_selector('input[type="email"]') or \
-                         page.query_selector('input[name="email"]')
-                    if not ei: time.sleep(0.5); continue
-                    ei.click(timeout=5000)
-                    time.sleep(0.3)
-                    ei2 = page.query_selector('input[type="email"]') or \
-                          page.query_selector('input[name="email"]')
-                    (ei2 or ei).fill(email)
-                    break
-                except Exception as e:
-                    if "not attached" in str(e).lower() or "detached" in str(e).lower():
-                        logger.info(f"[browser-reg] email input 脱链 重试 {_try+1}/4")
-                        time.sleep(0.5)
-                        continue
-                    raise
+            if not _fill_email_input(page, email):
+                page.screenshot(path="/tmp/browser_reg_email_fill_fail.png")
+                raise RuntimeError("邮箱输入框填写失败")
             time.sleep(random.uniform(0.5, 1.2))
             # Continue
             for sel in ['button[type="submit"]', 'button:has-text("Continue")',
