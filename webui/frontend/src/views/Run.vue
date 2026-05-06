@@ -200,6 +200,33 @@
         <div v-else class="inventory-empty">
           暂无账号库存；先跑一次注册/支付，等数据库同步完成后再点刷新。
         </div>
+
+        <section class="codex-export-card">
+          <h2>Codex 授权导出</h2>
+          <p class="muted">仅显示脱敏信息；完整 Token 只会在点击复制或下载并确认后读取。</p>
+          <p v-if="codexTokenError" class="inventory-error">{{ codexTokenError }}</p>
+          <div v-if="codexTokens.length === 0" class="inventory-empty">暂无可导出的 Codex 授权。</div>
+          <div v-for="item in codexTokens" :key="item.id" class="codex-token-row">
+            <div class="codex-token-main">
+              <strong>{{ item.email_masked }}</strong>
+              <span>{{ item.account_id_masked || '—' }}</span>
+              <small>{{ item.scope || 'scope —' }}</small>
+            </div>
+            <div class="codex-token-flags">
+              <span>ID: {{ item.has_id_token ? '已生成' : '缺失' }}</span>
+              <span>Access: {{ item.has_access_token ? '已生成' : '缺失' }}</span>
+              <span>Refresh: {{ item.has_refresh_token ? '已生成' : '缺失' }}</span>
+            </div>
+            <div class="codex-token-actions">
+              <button :data-testid="`codex-copy-${item.id}`" class="inventory-row-action" @click="copyCodexAuthJson(item.id)">
+                复制 Cockpit JSON
+              </button>
+              <button :data-testid="`codex-download-${item.id}`" class="inventory-row-action" @click="downloadCodexAuthJson(item.id)">
+                下载 auth.json
+              </button>
+            </div>
+          </div>
+        </section>
       </section>
 
       <Teleport to="body">
@@ -356,6 +383,17 @@ interface ConfigHealthResponse {
   blocking: ConfigHealthCheck[];
 }
 
+interface CodexTokenItem {
+  id: number;
+  email_masked: string;
+  account_id_masked: string;
+  has_id_token: boolean;
+  has_access_token: boolean;
+  has_refresh_token: boolean;
+  scope: string;
+  created_at: number;
+}
+
 const form = ref({
   mode: (router.currentRoute.value.query.mode as string) || "single",
   paypal: true,
@@ -404,6 +442,8 @@ const inventory = ref<InventoryResponse>({
   },
   accounts: [],
 });
+const codexTokens = ref<CodexTokenItem[]>([]);
+const codexTokenError = ref("");
 const selectedIds = ref<Set<number>>(new Set());
 const checkingIds = ref<Set<number>>(new Set());
 const inventoryBusy = ref(false);
@@ -677,6 +717,52 @@ function pushOneToCpa(id: number) { pushCpa([id], "推送 CPA"); }
 function pushSelectedToCpa() { pushCpa(Array.from(selectedIds.value), "批量推送选中"); }
 function pushAllUnpushed() { pushCpa(unpushedIds.value, "推送所有未推送"); }
 
+async function loadCodexTokens() {
+  try {
+    const response = await api.get<{ items: CodexTokenItem[] }>("/codex-tokens");
+    codexTokens.value = Array.isArray(response.data.items) ? response.data.items : [];
+    codexTokenError.value = "";
+  } catch (error: any) {
+    codexTokenError.value = error?.response?.status
+      ? `HTTP ${error.response.status}`
+      : (error?.message || "Codex token 列表加载失败");
+  }
+}
+
+async function fetchCodexExport(id: number) {
+  const response = await api.get<{ auth_json: string; filename: string }>(`/codex-tokens/${id}/export`);
+  return response.data;
+}
+
+async function copyCodexAuthJson(id: number) {
+  const ok = window.confirm("该 JSON 包含 OpenAI/Codex 长期登录凭据。任何获得它的人都可能访问此账号。请只导入你信任的本地 Cockpit Tools。");
+  if (!ok) return;
+  try {
+    const data = await fetchCodexExport(id);
+    await navigator.clipboard.writeText(data.auth_json);
+    message.success("Codex auth.json 已复制");
+  } catch (error: any) {
+    message.error(error?.response?.data?.detail || error?.message || "Codex auth.json 复制失败");
+  }
+}
+
+async function downloadCodexAuthJson(id: number) {
+  const ok = window.confirm("该 JSON 包含 OpenAI/Codex 长期登录凭据。任何获得它的人都可能访问此账号。请只导入你信任的本地 Cockpit Tools。");
+  if (!ok) return;
+  try {
+    const data = await fetchCodexExport(id);
+    const blob = new Blob([data.auth_json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = data.filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  } catch (error: any) {
+    message.error(error?.response?.data?.detail || error?.message || "Codex auth.json 下载失败");
+  }
+}
+
 async function refreshInventory() {
   if (inventoryLoading.value) return;
   inventoryLoading.value = true;
@@ -737,6 +823,7 @@ async function start() {
     lines.value = [];
     await refreshStatus();
     await refreshInventory();
+    await loadCodexTokens();
     openStream();
   } catch (e: any) {
     message.error(healthErrorText(e) || "启动失败");
@@ -786,6 +873,7 @@ function openStream() {
     otpDialog.value.open = false;
     await refreshStatus();
     await refreshInventory();
+    await loadCodexTokens();
   });
   eventSource.onerror = () => {
     // 连接断开，不自动 retry
@@ -853,11 +941,15 @@ onMounted(async () => {
   await refreshPreview();
   await checkConfigHealth();
   await refreshInventory();
+  await loadCodexTokens();
   if (status.value.running) {
     openStream();
   }
   statusTimer = setInterval(refreshStatus, 5000);
-  inventoryTimer = setInterval(refreshInventory, 15000);
+  inventoryTimer = setInterval(() => {
+    refreshInventory();
+    loadCodexTokens();
+  }, 15000);
 });
 
 onBeforeUnmount(() => {
@@ -1173,6 +1265,46 @@ onBeforeUnmount(() => {
   opacity: .5;
   cursor: not-allowed;
 }
+.codex-export-card {
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+.codex-export-card h2 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  color: var(--fg-primary);
+}
+.muted {
+  color: var(--fg-tertiary);
+  font-size: 11px;
+  line-height: 1.6;
+  margin: 0 0 10px;
+}
+.codex-token-row {
+  display: grid;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.codex-token-main {
+  display: grid;
+  gap: 4px;
+  color: var(--fg-secondary);
+  font-size: 12px;
+}
+.codex-token-main strong { color: var(--fg-primary); }
+.codex-token-main small { color: var(--fg-tertiary); word-break: break-all; }
+.codex-token-flags,
+.codex-token-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--fg-tertiary);
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
