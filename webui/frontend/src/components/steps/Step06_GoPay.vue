@@ -186,6 +186,7 @@ async function loadIngestInfo(force = false) {
 }
 
 onMounted(() => {
+  persistForm();
   loadIngestInfo();
   loadLinkStatus(true);
   // Both ingest-info.active (OTP API window) and link-state are live values:
@@ -310,10 +311,12 @@ watch(() => currentPhoneKey.value, () => {
   loadLinkStatus(true);
 });
 
-watch(form, () => {
-  store.setAnswer("gopay", form.value);
+function persistForm() {
+  store.setAnswer("gopay", { ...form.value });
   store.saveToServer();
-}, { deep: true });
+}
+
+watch(form, persistForm, { deep: true });
 </script>
 
 <style scoped>
