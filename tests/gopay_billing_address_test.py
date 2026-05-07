@@ -263,3 +263,161 @@ def test_update_and_gopay_payment_method_share_card_address(monkeypatch):
     assert (
         pm_data["billing_details[address][postal_code]"] == dynamic_addr["postal_code"]
     )
+
+
+def test_gopay_linking_429_recreates_checkout_with_frozen_address(monkeypatch):
+    card = _load_card_module()
+    dynamic_addr = {
+        "line1": "18 Orchard Rd",
+        "city": "Singapore",
+        "state": "Central",
+        "postal_code": "238839",
+        "country": "SG",
+    }
+    fetch_calls = []
+    fresh_urls = []
+    updated_addresses = []
+    pm_addresses = []
+    drive_urls = []
+    records = []
+
+    def fake_fetch(country):
+        fetch_calls.append(country)
+        return dynamic_addr
+
+    def fake_generate_fresh_checkout(*_args, **_kwargs):
+        idx = len(fresh_urls) + 1
+        url = f"https://checkout.stripe.com/c/pay/cs_retry_{idx}"
+        fresh_urls.append(url)
+        return {"url": url, "processor_entity": "openai_ie"}
+
+    def fake_parse_checkout_url(value):
+        return value.rsplit("/", 1)[-1], value
+
+    def fake_init_checkout(_session, session_id, *_args, **_kwargs):
+        return (
+            {
+                "mode": "setup",
+                "account_settings": {
+                    "display_name": "OpenAI",
+                    "account_id": "acct_test",
+                },
+            },
+            card.STRIPE_VERSION_BASE,
+            {
+                "locale": "en-US",
+                "elements_session_id": f"ess_{session_id}",
+                "stripe_js_id": f"js_{session_id}",
+                "config_id": f"cfg_{session_id}",
+            },
+        )
+
+    def fake_update_payment_page_address(
+        _session, _pk, _session_id, payment_card, _ctx, stripe_ver=None
+    ):
+        updated_addresses.append(dict(payment_card["address"]))
+
+    def fake_create_gopay_payment_method(
+        _session, _pk, payment_card, session_id, stripe_ver=None, ctx=None
+    ):
+        pm_addresses.append((session_id, dict(payment_card["address"])))
+        return f"pm_{session_id}"
+
+    def fake_confirm_payment(*args, **_kwargs):
+        session_id = args[2]
+        return {
+            "setup_intent": {
+                "next_action": {
+                    "type": "redirect_to_url",
+                    "redirect_to_url": {
+                        "url": f"https://pm-redirects.stripe.com/authorize/{session_id}",
+                    },
+                },
+            },
+        }
+
+    def fake_drive_gopay_from_redirect(redirect_url, *_args, **_kwargs):
+        drive_urls.append(redirect_url)
+        if len(drive_urls) == 1:
+            raise RuntimeError(
+                "midtrans linking 429 exhausted retries after 30 retries body="
+            )
+
+    monkeypatch.setattr(
+        card,
+        "load_config",
+        lambda _path: {
+            "cards": [_base_card()],
+            "captcha": {"api_key": ""},
+            "pre_solve_passive_captcha": False,
+            "gopay": {
+                "country_code": "62",
+                "phone_number": "81234567890",
+                "pin": "123456",
+                "checkout_429_retry_limit": 1,
+                "checkout_429_retry_sleep_s": 0,
+            },
+            "fresh_checkout": {"enabled": True, "plan": {"billing_country": "sg"}},
+        },
+    )
+    monkeypatch.setenv("SKIP_PAY_RT_EXCHANGE", "1")
+    monkeypatch.setattr(card.requests, "Session", lambda: _RecordingSession())
+    monkeypatch.setattr(
+        card, "register_fingerprint", lambda _session: ("guid", "muid", "sid")
+    )
+    monkeypatch.setattr(card, "generate_fresh_checkout", fake_generate_fresh_checkout)
+    monkeypatch.setattr(card, "parse_checkout_url", fake_parse_checkout_url)
+    monkeypatch.setattr(
+        card, "fetch_publishable_key", lambda *_args, **_kwargs: "pk_test"
+    )
+    monkeypatch.setattr(card, "init_checkout", fake_init_checkout)
+    monkeypatch.setattr(
+        card,
+        "_extract_checkout_totals",
+        lambda _resp: {"due": None, "subtotal": None, "total": None, "currency": "idr"},
+    )
+    monkeypatch.setattr(card, "fetch_elements_session", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(card, "lookup_consumer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        card, "update_payment_page_address", fake_update_payment_page_address
+    )
+    monkeypatch.setattr(card, "_fetch_meiguodizhi_address", fake_fetch)
+    monkeypatch.setattr(
+        card, "extract_hcaptcha_config", lambda _resp: {"site_key": "site", "rqdata": ""}
+    )
+    monkeypatch.setattr(
+        card,
+        "extract_passive_captcha_config",
+        lambda *_args, **_kwargs: {"site_key": "passive", "rqdata": ""},
+    )
+    monkeypatch.setattr(card, "send_telemetry_batch", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        card, "create_gopay_payment_method", fake_create_gopay_payment_method
+    )
+    monkeypatch.setattr(card, "confirm_payment", fake_confirm_payment)
+    monkeypatch.setattr(card, "_drive_gopay_from_redirect", fake_drive_gopay_from_redirect)
+    monkeypatch.setattr(
+        card,
+        "poll_result",
+        lambda *_args, **_kwargs: {"state": "succeeded", "return_url": ""},
+    )
+    monkeypatch.setattr(card, "_record_result", lambda **kwargs: records.append(kwargs))
+
+    result = card.run("fresh", config_path="unused.json", use_gopay=True, force_fresh=True)
+
+    assert result["state"] == "succeeded"
+    assert fresh_urls == [
+        "https://checkout.stripe.com/c/pay/cs_retry_1",
+        "https://checkout.stripe.com/c/pay/cs_retry_2",
+    ]
+    assert fetch_calls == ["SG"]
+    assert updated_addresses == [dynamic_addr, dynamic_addr]
+    assert pm_addresses == [
+        ("cs_retry_1", dynamic_addr),
+        ("cs_retry_2", dynamic_addr),
+    ]
+    assert drive_urls == [
+        "https://pm-redirects.stripe.com/authorize/cs_retry_1",
+        "https://pm-redirects.stripe.com/authorize/cs_retry_2",
+    ]
+    assert len(records) == 1

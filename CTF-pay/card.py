@@ -194,6 +194,34 @@ class FreshCheckoutAuthError(RuntimeError):
     pass
 
 
+def _is_gopay_linking_429_exhausted(exc: BaseException) -> bool:
+    return "midtrans linking 429 exhausted retries" in str(exc).lower()
+
+
+def _gopay_checkout_429_retry_limit(cfg: dict) -> int:
+    gp = cfg.get("gopay") if isinstance(cfg.get("gopay"), dict) else {}
+    fresh = cfg.get("fresh_checkout") if isinstance(cfg.get("fresh_checkout"), dict) else {}
+    if "checkout_429_retry_limit" in gp:
+        raw = gp.get("checkout_429_retry_limit")
+    elif "max_checkout_429_retries" in gp:
+        raw = gp.get("max_checkout_429_retries")
+    else:
+        raw = fresh.get("gopay_checkout_429_retry_limit", 3)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _gopay_checkout_429_retry_sleep_s(cfg: dict) -> float:
+    gp = cfg.get("gopay") if isinstance(cfg.get("gopay"), dict) else {}
+    raw = gp.get("checkout_429_retry_sleep_s", gp.get("checkout_429_cooldown_s", 5))
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 5.0
+
+
 def _build_proxy_url_from_cfg(proxy_cfg) -> str:
     if not proxy_cfg:
         return ""
@@ -8345,8 +8373,12 @@ def run(
     use_paypal: bool = False,
     use_gopay: bool = False,
     gopay_otp_file: str = "",
+    _preserve_log: bool = False,
+    _card_snapshot: dict | None = None,
+    _gopay_checkout_429_retry_count: int = 0,
 ):
-    _init_log()  # 初始化日志文件
+    if not _preserve_log:
+        _init_log()  # 初始化日志文件
 
     cfg = load_config(config_path)
     runtime_cfg = cfg.get("runtime", {})
@@ -8356,7 +8388,8 @@ def run(
     cards = cfg["cards"]
     if card_index >= len(cards):
         raise ValueError(f"卡索引 {card_index} 超出范围，共 {len(cards)} 张卡")
-    card = json.loads(json.dumps(cards[card_index]))
+    card = json.loads(json.dumps(_card_snapshot if _card_snapshot is not None else cards[card_index]))
+    frozen_gopay_card = _card_snapshot is not None
     captcha_cfg = cfg["captcha"]
     resolved_config_path = cfg.get("_loaded_from", config_path)
     if offline_replay:
@@ -8413,7 +8446,7 @@ def run(
     addr = dict(card.get("address", {}) or {})
     card["address"] = addr
 
-    if cfg.get("randomize_identity", False):
+    if cfg.get("randomize_identity", False) and not frozen_gopay_card:
         card["name"] = _gen_name()
         card["email"] = _gen_email()
         line1 = addr.get("line1", "")
@@ -8576,7 +8609,15 @@ def run(
     elif use_gopay:
         init_ctx["confirm_mode"] = "shared_payment_method"
         init_ctx["payment_method_type"] = "gopay"
-        _prepare_gopay_billing_address(card, cfg)
+        if frozen_gopay_card:
+            frozen_addr = card.get("address") or {}
+            _log(
+                "      [gopay] 复用冻结账单地址: "
+                f"{frozen_addr.get('city', '')}, "
+                f"{frozen_addr.get('state', '')} {frozen_addr.get('postal_code', '')}"
+            )
+        else:
+            _prepare_gopay_billing_address(card, cfg)
         addr = card["address"]
     else:
         init_ctx["confirm_mode"] = runtime_cfg.get("confirm_mode", "inline_payment_method_data")
@@ -8723,6 +8764,58 @@ def run(
     with _http_session_stage_proxy(http, stage_proxy_cfg, "telemetry_card_input"):
         send_telemetry_batch(http, session_id, init_ctx, phase="card_input")
 
+    def _retry_fresh_checkout_after_gopay_429(exc: RuntimeError) -> dict:
+        retry_limit = _gopay_checkout_429_retry_limit(cfg)
+        if _gopay_checkout_429_retry_count >= retry_limit:
+            _log(
+                "      [gopay] Midtrans linking 429 后 fresh checkout 重建次数已耗尽 "
+                f"({_gopay_checkout_429_retry_count}/{retry_limit})"
+            )
+            raise exc
+        if not fresh_cfg.get("enabled", False):
+            _log("      [gopay] fresh_checkout 未启用，无法在 linking 429 后重新创建账单")
+            raise exc
+
+        next_attempt = _gopay_checkout_429_retry_count + 1
+        sleep_s = _gopay_checkout_429_retry_sleep_s(cfg)
+        _log(
+            "      [gopay] Midtrans linking 429 内层重试已耗尽，"
+            f"冻结当前账单地址并重新创建 checkout ({next_attempt}/{retry_limit}) ..."
+        )
+        if sleep_s > 0:
+            _log(f"      [gopay] fresh checkout retry 冷却 {sleep_s}s")
+            time.sleep(sleep_s)
+        return run(
+            checkout_input,
+            card_index=card_index,
+            config_path=config_path,
+            manual_token=manual_token,
+            force_fresh=True,
+            fresh_only=False,
+            offline_replay=offline_replay,
+            local_mock=local_mock,
+            use_paypal=False,
+            use_gopay=True,
+            gopay_otp_file=gopay_otp_file,
+            _preserve_log=True,
+            _card_snapshot=json.loads(json.dumps(card)),
+            _gopay_checkout_429_retry_count=next_attempt,
+        )
+
+    def _drive_gopay_or_retry(redirect_url: str) -> bool:
+        try:
+            _drive_gopay_from_redirect(
+                redirect_url, cfg, gopay_otp_file,
+                session_id=session_id,
+            )
+            _log("      GoPay 授权 + 扣款完成，继续 poll 结果 ...")
+            return True
+        except RuntimeError as e:
+            if _is_gopay_linking_429_exhausted(e):
+                init_ctx["gopay_checkout_retry_result"] = _retry_fresh_checkout_after_gopay_429(e)
+                return False
+            raise
+
     def _submit_confirm(captcha_token: str, captcha_ekey: str):
         measured_time_on_page = int(time.time() * 1000) - init_ctx.get(
             "page_load_ts", int(time.time() * 1000)
@@ -8796,11 +8889,8 @@ def run(
                 if paypal_redirect_url:
                     _log(f"      redirect URL: {paypal_redirect_url[:100]}...")
                     if use_gopay:
-                        _drive_gopay_from_redirect(
-                            paypal_redirect_url, cfg, gopay_otp_file,
-                            session_id=session_id,
-                        )
-                        _log("      GoPay 授权 + 扣款完成，继续 poll 结果 ...")
+                        if not _drive_gopay_or_retry(paypal_redirect_url):
+                            return confirm_data
                     else:
                         success = _handle_paypal_redirect(
                             paypal_redirect_url,
@@ -8917,10 +9007,9 @@ def run(
                             if url:
                                 _log(f"      [manual_approval] 拿到 redirect: {url[:100]}")
                                 if use_gopay:
-                                    _drive_gopay_from_redirect(
-                                        url, cfg, gopay_otp_file,
-                                        session_id=session_id,
-                                    )
+                                    if not _drive_gopay_or_retry(url):
+                                        got_redirect = True
+                                        break
                                     got_redirect = True
                                     break
                                 success = _handle_paypal_redirect(
@@ -9035,6 +9124,10 @@ def run(
                         _log(f"      重新 confirm 获取新的 challenge ({confirm_attempt}/{max_confirm_attempts}) ...")
                         continue
                 raise
+
+    gopay_checkout_retry_result = init_ctx.get("gopay_checkout_retry_result")
+    if gopay_checkout_retry_result:
+        return gopay_checkout_retry_result
 
   
     with _http_session_stage_proxy(http, stage_proxy_cfg, "telemetry_poll"):

@@ -5,7 +5,6 @@ All HTTP endpoints are mocked via the `responses` library; no live network.
 from __future__ import annotations
 
 import importlib.util
-import sys
 import time
 from pathlib import Path
 
@@ -213,7 +212,9 @@ def test_full_flow_succeeds():
 
 
 @responses.activate
-def test_linking_406_exhaustion_raises():
+def test_linking_406_exhaustion_raises(monkeypatch):
+    monkeypatch.setattr(gopay.time, "sleep", lambda _seconds: None)
+
     # Pre-flow: stub the early steps minimally so we get to linking
     responses.post("https://chatgpt.com/backend-api/payments/checkout", json={"id": CS_ID, "session_id": CS_ID})
     responses.post("https://api.stripe.com/v1/payment_methods", json={"id": PM_ID})
@@ -246,6 +247,59 @@ def test_linking_406_exhaustion_raises():
     charger = build_charger()
     with pytest.raises(gopay.GoPayError, match="exhausted"):
         charger.run(stripe_pk=STRIPE_PK)
+
+
+# ────────────────── 429 retry handling ──────────────────
+
+
+@responses.activate
+def test_linking_429_retries_until_success(monkeypatch):
+    logs: list[str] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(gopay.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    url = f"https://app.midtrans.com/snap/v3/accounts/{SNAP_TOKEN}/linking"
+    responses.post(url, status=429, body="")
+    responses.post(url, status=429, body="rate limited")
+    responses.post(
+        url,
+        json={
+            "status_code": "201",
+            "activation_link_url": (
+                f"https://merchants-gws-app.gopayapi.com/app/authorize?reference={LINK_REF}&target=gwc"
+            ),
+        },
+        status=201,
+    )
+
+    charger = build_charger()
+    charger.log = logs.append
+
+    assert charger._midtrans_init_linking(SNAP_TOKEN) == LINK_REF
+    assert len([line for line in logs if "midtrans linking 429" in line]) == 2
+    assert len(sleeps) == 2
+
+
+@responses.activate
+def test_linking_429_exhaustion_logs_each_failed_call(monkeypatch):
+    logs: list[str] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(gopay, "LINK_429_RETRY_LIMIT", 3)
+    monkeypatch.setattr(gopay.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    url = f"https://app.midtrans.com/snap/v3/accounts/{SNAP_TOKEN}/linking"
+    for _ in range(gopay.LINK_429_RETRY_LIMIT + 1):
+        responses.post(url, status=429, body="")
+
+    charger = build_charger()
+    charger.log = logs.append
+
+    with pytest.raises(gopay.GoPayError, match="429 exhausted retries"):
+        charger._midtrans_init_linking(SNAP_TOKEN)
+
+    assert len([line for line in logs if "midtrans linking 429" in line]) == gopay.LINK_429_RETRY_LIMIT + 1
+    assert any("retry limit reached 3/3" in line for line in logs)
+    assert len(sleeps) == gopay.LINK_429_RETRY_LIMIT
 
 
 # ────────────────── OTP cancel ──────────────────

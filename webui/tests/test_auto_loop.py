@@ -14,7 +14,7 @@ def test_auto_loop_classify_kinds(client):
         "proxy_dead": [
             "curl_cffi.requests.exceptions.ProxyError: Failed to perform, curl: (97) cannot complete SOCKS5 connection to chatgpt.com.",
         ],
-        "cf_429": ["[ERROR] GoPayError: midtrans linking unexpected status=429 body="],
+        "cf_429": ["[ERROR] GoPayError: midtrans linking 429 exhausted retries after 30 retries body="],
         "otp_validate_400": [
             '  File "CTF-pay/gopay.py", line 488, in _gopay_validate_otp',
             "    r.raise_for_status()",
@@ -120,7 +120,7 @@ def test_auto_loop_409_when_already_running(client, monkeypatch):
 
 def test_auto_loop_409_when_runner_running(client, monkeypatch):
     _login(client)
-    from webui.backend import auto_loop, runner
+    from webui.backend import runner
 
     monkeypatch.setattr(runner, "status", lambda: {"running": True})
     r = client.post("/api/auto-loop/start", json={"target_success": 1, "max_consec_fail": 1})

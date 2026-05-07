@@ -47,6 +47,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import requests
+
+# Cloudflare 拦 plain requests 的 TLS 指纹（403 + HTML challenge），跟 card.py 一致用 curl_cffi
+# 模拟真 Chrome 指纹。
+try:
+    from curl_cffi.requests import Session as _CurlCffiSession  # type: ignore
+except ImportError:
+    _CurlCffiSession = None  # type: ignore
+
 _ENV_PLACEHOLDER_PATH = Path(__file__).resolve().parent / "env_placeholder.py"
 _ENV_PLACEHOLDER_SPEC = importlib.util.spec_from_file_location(
     "ctf_pay_env_placeholder", _ENV_PLACEHOLDER_PATH
@@ -57,15 +66,6 @@ _env_placeholder = importlib.util.module_from_spec(_ENV_PLACEHOLDER_SPEC)
 _ENV_PLACEHOLDER_SPEC.loader.exec_module(_env_placeholder)
 PlaceholderResolutionError = _env_placeholder.PlaceholderResolutionError
 resolve_placeholder = _env_placeholder.resolve_placeholder
-
-import requests
-
-# Cloudflare 拦 plain requests 的 TLS 指纹（403 + HTML challenge），跟 card.py 一致用 curl_cffi
-# 模拟真 Chrome 指纹。
-try:
-    from curl_cffi.requests import Session as _CurlCffiSession  # type: ignore
-except ImportError:
-    _CurlCffiSession = None  # type: ignore
 
 
 def _new_session(impersonate: str = "chrome136") -> Any:
@@ -94,6 +94,8 @@ GOPAY_PIN_CLIENT_ID_CHARGE = "47180a8e-f56e-11ed-a05b-0242ac120003-GWC"
 DEFAULT_TIMEOUT = 30
 LINK_RETRY_LIMIT = 2  # 406 "account already linked" retry
 LINK_RETRY_SLEEP_S = 12.0  # Midtrans 需要冷却 ~10s 才会让 406 → 201（实测）
+LINK_429_RETRY_LIMIT = 30  # Retry calls after the first Midtrans linking 429
+LINK_429_RETRY_SLEEP_S = 2.0
 DEFAULT_OTP_REGEX = r"(?<!\d)(\d{6})(?!\d)"
 
 
@@ -459,7 +461,7 @@ class GoPayCharger:
     # ───── Step 7: Midtrans linking initiation ─────
 
     def _midtrans_init_linking(self, snap_token: str) -> str:
-        """POST snap/v3/accounts/{snap}/linking. Retries on 406."""
+        """POST snap/v3/accounts/{snap}/linking. Retries on 406 and 429."""
         url = f"https://app.midtrans.com/snap/v3/accounts/{snap_token}/linking"
         body = {
             "type": "gopay",
@@ -473,7 +475,9 @@ class GoPayCharger:
             "Referer": f"https://app.midtrans.com/snap/v4/redirection/{snap_token}",
         }
         last_err: Optional[str] = None
-        for attempt in range(1, LINK_RETRY_LIMIT + 2):
+        link_406_failures = 0
+        link_429_retries = 0
+        while True:
             r = self.ext.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT)
             if r.status_code == 201:
                 data = r.json()
@@ -484,6 +488,7 @@ class GoPayCharger:
                 self.log(f"[gopay] midtrans linking ok reference={ref}")
                 return ref
             if r.status_code == 406:
+                link_406_failures += 1
                 try:
                     j = r.json()
                 except Exception:
@@ -494,8 +499,31 @@ class GoPayCharger:
                     last_err = str(j[0])
                 else:
                     last_err = r.text[:120]
-                self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {attempt}/{LINK_RETRY_LIMIT}")
+                if link_406_failures > LINK_RETRY_LIMIT:
+                    break
+                self.log(f"[gopay] midtrans linking 406 ({last_err}), 冷却 {LINK_RETRY_SLEEP_S}s 再重试 {link_406_failures}/{LINK_RETRY_LIMIT}")
                 time.sleep(LINK_RETRY_SLEEP_S)
+                continue
+            if r.status_code == 429:
+                body_preview = r.text[:300] or "<empty>"
+                last_err = f"429 body={body_preview}"
+                if link_429_retries >= LINK_429_RETRY_LIMIT:
+                    self.log(
+                        "[gopay] midtrans linking 429 "
+                        f"({last_err}), retry limit reached "
+                        f"{link_429_retries}/{LINK_429_RETRY_LIMIT}"
+                    )
+                    raise GoPayError(
+                        "midtrans linking 429 exhausted retries "
+                        f"after {link_429_retries} retries body={r.text[:300]}",
+                    )
+                link_429_retries += 1
+                self.log(
+                    "[gopay] midtrans linking 429 "
+                    f"({last_err}), 冷却 {LINK_429_RETRY_SLEEP_S}s 再重试 "
+                    f"{link_429_retries}/{LINK_429_RETRY_LIMIT}"
+                )
+                time.sleep(LINK_429_RETRY_SLEEP_S)
                 continue
             raise GoPayError(
                 f"midtrans linking unexpected status={r.status_code} body={r.text[:300]}",

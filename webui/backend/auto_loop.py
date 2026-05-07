@@ -80,7 +80,7 @@ _KIND_PATTERNS = [
         r"SOCKS5.*Network unreachable",
         re.I,
     )),
-    ("cf_429",              re.compile(r"midtrans linking unexpected status=429")),
+    ("cf_429",              re.compile(r"midtrans linking (?:unexpected status=429|429 exhausted retries)")),
     ("already_paid",        re.compile(r'User is already paid', re.I)),
     ("otp_validate_400",    re.compile(r"_gopay_validate_otp.*\n.*HTTPError|HTTP Error 400.*\n.*_gopay_validate_otp", re.S)),
     ("otp_timeout",         re.compile(r"OTPCancelled|OTP timeout after")),
