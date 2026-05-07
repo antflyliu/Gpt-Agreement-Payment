@@ -124,6 +124,8 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
             "phone_number": "FAKE_GOPAY_PHONE_FROM_WIZARD",
             "pin": "FAKE_GOPAY_PIN_FROM_WIZARD",
             "otp_timeout": 240,
+            "checkout_429_retry_limit": 7,
+            "checkout_429_retry_sleep_s": 11,
         },
     }
     r = client.post("/api/config/export", json={"answers": answers})
@@ -141,6 +143,8 @@ def test_export_writes_gopay_auto_otp(client, tmp_path, monkeypatch):
     assert "url" not in pay["gopay"]["otp"]
     assert pay["gopay"]["otp"]["timeout"] == 240
     assert pay["gopay"]["otp"]["interval"] == 1
+    assert pay["gopay"]["checkout_429_retry_limit"] == 7
+    assert pay["gopay"]["checkout_429_retry_sleep_s"] == 11.0
 
 
 
@@ -163,6 +167,8 @@ def test_export_writes_gopay_placeholders_without_stored_credentials(client, tmp
     assert pay["gopay"]["phone_number"] == "YOUR_PHONE_NUMBER"
     assert pay["gopay"]["pin"] == "YOUR_6_DIGIT_GOPAY_PIN"
     assert pay["gopay"]["otp"]["timeout"] == 240
+    assert pay["gopay"]["checkout_429_retry_limit"] == 3
+    assert pay["gopay"]["checkout_429_retry_sleep_s"] == 5.0
 
 
 def test_export_writes_hosted_checkout_link_mode(client, tmp_path, monkeypatch):

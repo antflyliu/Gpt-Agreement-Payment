@@ -48,6 +48,24 @@ def _payment_method(answers: dict) -> str:
     return (answers.get("payment") or {}).get("method", "both")
 
 
+def _int_or_default(value, default: int) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or_default(value, default: float) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _project_pay(answers: dict) -> dict:
     """Map flat wizard answers onto CTF-pay config schema."""
     out: dict = {}
@@ -70,6 +88,8 @@ def _project_pay(answers: dict) -> dict:
             "country_code": country_code,
             "phone_number": "YOUR_PHONE_NUMBER",
             "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+            "checkout_429_retry_limit": _int_or_default(gp.get("checkout_429_retry_limit"), 3),
+            "checkout_429_retry_sleep_s": _float_or_default(gp.get("checkout_429_retry_sleep_s"), 5.0),
         }
         if gp.get("midtrans_client_id"):
             out["gopay"]["midtrans_client_id"] = gp["midtrans_client_id"]

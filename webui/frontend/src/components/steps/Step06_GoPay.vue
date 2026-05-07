@@ -7,6 +7,8 @@
     <div class="form-stack">
       <TermField v-model="form.country_code" label="国家码 · country_code" placeholder="86 (中国大陆) / 62 (印尼)" />
       <TermField v-model.number="form.otp_timeout" label="OTP 等待超时秒数" type="number" />
+      <TermField v-model.number="form.checkout_429_retry_limit" label="429 重建账单最多次数" type="number" />
+      <TermField v-model.number="form.checkout_429_retry_sleep_s" label="429 重建前冷却秒数" type="number" />
       <TermSelect
         v-model="form.whatsapp_engine"
         label="WhatsApp 引擎"
@@ -125,6 +127,8 @@ const form = ref({
   phone_number: "YOUR_PHONE_NUMBER",
   pin: "YOUR_6_DIGIT_GOPAY_PIN",
   otp_timeout: init.otp_timeout ?? initOtp.timeout ?? 300,
+  checkout_429_retry_limit: init.checkout_429_retry_limit ?? 3,
+  checkout_429_retry_sleep_s: init.checkout_429_retry_sleep_s ?? 5,
   whatsapp_engine: init.whatsapp_engine ?? "baileys",
 });
 
