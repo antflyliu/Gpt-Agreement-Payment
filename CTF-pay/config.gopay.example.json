@@ -4,6 +4,10 @@
     "country_code": "62",
     "phone_number": "YOUR_PHONE_NUMBER",
     "pin": "YOUR_6_DIGIT_GOPAY_PIN",
+    "trace": {
+      "unbind_candidates": true,
+      "sensitive_tokens": false
+    },
     "otp": {
       "source": "auto",
       "timeout": 300,
